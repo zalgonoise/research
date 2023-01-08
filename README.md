@@ -1,6 +1,6 @@
 ## [research](https://github.com/zalgonoise/research/wiki)
 
-*A general repository for research topics and deep-dives into topics without an actual end-purpose*
+*Research and deep-dives into topics without an actual end-purpose*
 
 ___________
 
