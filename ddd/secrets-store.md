@@ -31,6 +31,8 @@ Of course, the app will have a few other services to support authentication, aut
 
 Like the diagram above implies, at least two entities are necessary: User and Secret.
 
+These entities determine the structure of the handled data.  
+
 #### User
 
 ```go
@@ -92,7 +94,7 @@ Storing this data could be easily done in a simple manner, in a relational datab
 1. A **SQLite database** to serve as a relational database for the users and secrets / shares metadata.
 2. A **Bolt database** to serve as a key-value store, holding the sensitive information for the user's secrets, the user's private encryption key and any other type of sensitive information.
 
-Please note below the SQLite tables structure for this project:
+Please note below how do the entities and model above translate to an RDB table structure, for this project:
 
 #### `users` table
 
@@ -130,3 +132,21 @@ col. name | type | PK | FK
 `until` | TIMESTAMP | |
 
 > *Shared secrets table will hold the metadata about the share; such as from-to user IDs, the secret's ID and a time limit if set. If the secret is shared with multiple users, there will be multiple entries simliar to each other, with different `shared_with` values*
+
+### Actions and operations
+
+This application will require a CRUD implementation for both users and secrets, as well as added actions to share the secrets with one (or more) user(s).
+
+As for the users repository, it will expose a complete set of CRUD operations (with `list`); but secrets will not contain an update operation -- its `create` operation will be designed to overwrite the secret if it already exists.
+
+The secrets repository will contain additional methods to share the secret until a period in time, or for a certain duration. The removal of an expired shared secret is done when reading it; so if a user lists their secrets which currently include an expired shared secret, it will be removed before the list response is returned to the caller.
+
+### Security
+
+Initially, the users will login using a dedicated endpoint, using a username + password combination. The call returns a JWT if their credentials are valid, and the caller can use the JWT as an Authorization HTTP header calling users and secrets endpoints. JWT expire within one hour of being created.
+
+Creating a user does not require authentication.
+
+When a user is created, the service will create an encryption private key in the Bolt database that will be used to encrypt the user's secrets' values. Also, when created, a random 128-byte-long salt value is generated and appended to the user's password; and the resulting value is hashed. The SQLite database will store this salt and hash values, not the user's password.
+
+A user can only access their own resources. A secret shared by user A with user B is perceived as a (new) secret owned by user B in a read operation; which may contain an expiry. However, the actual owner is in control of this secret -- as shared secrets are read-write only for the actual owner.
