@@ -70,6 +70,7 @@ type Secret struct {
 
 > A secret object will hold its key-value data, as well as a timestamp value for when it was created
 
+#### Shared
 
 ```go
 package shared
@@ -359,17 +360,17 @@ import (
 
 type Repository interface {
 	// Get fetches the secret's share metadata for a given username and secret key
-	Get(ctx context.Context, usename, secretName string) (*Shared, error)
+	Get(ctx context.Context, username, secretName string) (*Shared, error)
 	// Create shares the secret identified by `secretName`, owned by `owner`, with
 	// user `target`. Returns an error
 	Create(ctx context.Context, owner, secretName string, targets ...string) error
-	// ShareUntil is similar to Share, but scopes the shared secret until `until` time
+	// CreateUntil is similar to Create, but scopes the shared secret until `until` time
 	CreateUntil(ctx context.Context, owner, secretName string, until time.Time, targets ...string) error
-	// ShareFor is similar to ShareUntil, but scopes the shared secret for `dur` amount of time
+	// CreateFor is similar to CreateUntil, but scopes the shared secret for `dur` amount of time
 	CreateFor(ctx context.Context, owner, secretName string, dur time.Duration, targets ...string) error
-	// Unshare removes the user `target` from the secret share
+	// Delete removes the user `target` from the secret share
 	Delete(ctx context.Context, owner, secretName string, targets ...string) error
-	// UnshareAll removes the shared secret completely so it's private to the owner again
+	// Purge removes the shared secret completely so it's private to the owner again
 	Purge(ctx context.Context, owner, secretName string) error
 }
 ```
