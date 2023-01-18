@@ -62,6 +62,7 @@ package secret
 // is a slice of bytes. Secrets are encrypted then stored with a user-scoped
 // private key
 type Secret struct {
+	ID        uint64
 	Key       string
 	Value     []byte
 	CreatedAt time.Time
@@ -77,11 +78,13 @@ package shared
 
 // Shared is metadata for a secret that a user (the owner) shares with a set of users
 // optionally within a limited period of time
-type Shared struct {
-	Key    string
-	Owner  user.User
-	Shares []user.User
-	Until  time.Time
+type Share struct {
+	ID        uint64
+	Secret    secret.Secret
+	Owner     user.User
+	Target    []user.User
+	Until     time.Time
+	CreatedAt time.Time
 }
 ```
 
@@ -131,6 +134,7 @@ col. name | type | PK | FK
 `secret_id` | INTEGER | | `secrets (id)`
 `shared_with` | INTEGER | | `users (id)`
 `until` | TIMESTAMP | |
+`created_at` | TIMESTAMP | |
 
 > *Shared secrets table will hold the metadata about the share; such as from-to user IDs, the secret's ID and a time limit if set. If the secret is shared with multiple users, there will be multiple entries simliar to each other, with different `shared_with` values*
 
@@ -267,6 +271,7 @@ import (
 // is a slice of bytes. Secrets are encrypted then stored with a user-scoped
 // private key
 type Secret struct {
+	ID        uint64
 	Key       string
 	Value     []byte
 	CreatedAt time.Time
@@ -321,7 +326,9 @@ This package will be a top-level folder in the project named `shared`, with:
 
 #### `shared.go` - defining entities
 
-A Shared type will contain a User (as an owner) and a list of Users with whom the secret is shared with; as the type implies such reference. It also embeds the Secret type, instead of having it as a struct element
+A Share type will contain a User (as an owner) and a list of Users with whom the secret is shared with; as the type implies such reference. It also contains the actual secret being shared.
+
+Since Share may have different `Share.Until` values (including `nil`), it is usually returned as a list, even for a "Get" operation.
 
 ```go
 package shared
@@ -329,49 +336,43 @@ package shared
 import (
 	"time"
 
+	"github.com/zalgonoise/x/secr/secret"
 	"github.com/zalgonoise/x/secr/user"
 )
 
 // Shared is metadata for a secret that a user (the owner) shares with a set of users
 // optionally within a limited period of time
-type Shared struct {
-	Key    string
-	Owner  user.User
-	Shares []user.User
-	Until  time.Time
+type Share struct {
+	ID        uint64
+	Secret    secret.Secret
+	Owner     user.User
+	Target    []user.User
+	Until     time.Time
+	CreatedAt time.Time
 }
 ```
 
 #### `repository.go` - defining the actions
 
-The `shared.Repository` is very simple; it basically allows sharing or unsharing a secret with one or more users, with fancy methods to:
-- share until a certain point in time
-- share for a certain period of time
-- unshare a secret from all users at once
-- fetch the secret's share metadata
+The `shared.Repository` is just as simple as the secrets': a set of CRUD operations without Update. The persistence layer (which implements the repository) will be solely responsible of saving the shared secrets state. Any features to this implementation (sharing for a duration of time, sharing until a point in time) will be handled by the service layer.
 
 ```go
 package shared
 
 import (
 	"context"
-	"time"
 )
 
 type Repository interface {
 	// Get fetches the secret's share metadata for a given username and secret key
-	Get(ctx context.Context, username, secretName string) (*Shared, error)
+	Get(ctx context.Context, username, secretName string) ([]*Share, error)
+	// List fetches all shared secrets for a given username
+	List(ctx context.Context, username string) ([]*Share, error)
 	// Create shares the secret identified by `secretName`, owned by `owner`, with
 	// user `target`. Returns an error
-	Create(ctx context.Context, owner, secretName string, targets ...string) error
-	// CreateUntil is similar to Create, but scopes the shared secret until `until` time
-	CreateUntil(ctx context.Context, owner, secretName string, until time.Time, targets ...string) error
-	// CreateFor is similar to CreateUntil, but scopes the shared secret for `dur` amount of time
-	CreateFor(ctx context.Context, owner, secretName string, dur time.Duration, targets ...string) error
+	Create(ctx context.Context, s *Share) error
 	// Delete removes the user `target` from the secret share
-	Delete(ctx context.Context, owner, secretName string, targets ...string) error
-	// Purge removes the shared secret completely so it's private to the owner again
-	Purge(ctx context.Context, owner, secretName string) error
+	Delete(ctx context.Context, s *Share) error
 }
 ```
 
