@@ -72,12 +72,12 @@ type Secret struct {
 
 
 ```go
-package secret
+package shared
 
-// Shared is a type of secret that a user (the owner) shares with a set of users
+// Shared is metadata for a secret that a user (the owner) shares with a set of users
 // optionally within a limited period of time
 type Shared struct {
-	Secret
+	Key    string
 	Owner  user.User
 	Shares []user.User
 	Until  time.Time
@@ -150,3 +150,233 @@ Creating a user does not require authentication.
 When a user is created, the service will create an encryption private key in the Bolt database that will be used to encrypt the user's secrets' values. Also, when created, a random 128-byte-long salt value is generated and appended to the user's password; and the resulting value is hashed. The SQLite database will store this salt and hash values, not the user's password.
 
 A user can only access their own resources. A secret shared by user A with user B is perceived as a (new) secret owned by user B in a read operation; which may contain an expiry. However, the actual owner is in control of this secret -- as shared secrets are read-write only for the actual owner.
+
+While there is a reserved username (`root`) despite not having a roles / privileges model; the Bolt database will still store user secrets in buckets identified by the user's (internal) ID, and not their username.
+
+### Product Format
+
+The final application will be initially distributed as a web application, as a HTTP API. It could potentially have a CLI client that communicates with a configured secrets store server via HTTP (performing the same HTTP calls, but from a CLI app).
+
+While there are no plans for an actual frontend with a UI, the simplest approach to doing so would be with a Flutter / Dart project which is simple and distributable on a number of platforms.
+
+_______________
+
+## Implementation
+
+Having a general structure planned ahead is essential to organize the codebase before any code is written. Having the context on what we want from the above, it's easier to sketch out the entities and repositories for this application:
+
+### The `user` package
+
+This package will be a top-level folder in the project named `user`, with:
+
+```
+.
+└─ user
+    ├─ repository.go -- lists the actions supported by the repository
+    └─ user.go -- describes the user entity
+```
+
+#### `user.go` - defining entities
+
+Just like the snippet a few blocks above, this file is very straight-forward and will contain the user entity, which describes the basic elements of a user. Additionally it will already include the Session type, which is an authenticated user (user with a session token); since this is also within the realm of the *users*. 
+
+```go
+package user
+
+import (
+	"time"
+)
+
+// User is a person (or entity) that uses the application to store
+// secrets. They will have a unique username.
+type User struct {
+	ID        uint64
+	Username  string
+	Name      string
+	Hash      string
+	Salt      string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+// Session is an authorized user, accompanied by a JWT
+type Session struct {
+	User
+	Token string
+}
+```
+
+#### `repository.go` - defining the actions
+
+The users repository will contain a set of actions which will target the `users` SQL table described in the Design chapter. This means that it does not contain methods related to login; only CRUD operations against actual users:
+
+```go
+package user
+
+import "context"
+
+// Repository describes the actions exposed by the users store
+type Repository interface {
+	// Create will create a user `u`, returning its ID and an error
+	Create(ctx context.Context, u *User) (uint64, error)
+	// Update will update the user `username` with its updated version `updated`. Returns an error
+	Update(ctx context.Context, username string, updated *User) error
+	// Get returns the user identified by `username`, and an error
+	Get(ctx context.Context, username string) (*User, error)
+	// List returns all the users, and an error
+	List(ctx context.Context) ([]*User, error)
+	// Delete removes the user identified by `username`, returning an error
+	Delete(ctx context.Context, username string) error
+}
+```
+
+> All repository methods accept a context as a first argument to allow retrieving more observability information, as covered further down this document.
+
+#### Users recap
+
+In a nutshell this is the domain abstraction of the data stored in the database. It allows for the persistence layer (the databases) to have different implementations -- while also deferring the responsibility of persisting those objects to a different module.
+
+The domain entity and repository interface state what this object (the user) is and what we can do with it.
+
+____________
+
+### The `secret` package
+
+This package will be a top-level folder in the project named `secret`, with:
+
+```
+.
+└─ secret
+    ├─ repository.go -- lists the actions supported by the repository
+    └─ secret.go -- describes the secret entity
+```
+
+#### `secret.go` - defining entities
+
+Very similar to the user; the Secret type will contain the basic elements of a Secret. Note how a (basic) secret does not reference a user in it:
+
+```go
+package secret
+
+import (
+	"time"
+)
+
+// Secret is a key-value pair where they Key is string type and Value
+// is a slice of bytes. Secrets are encrypted then stored with a user-scoped
+// private key
+type Secret struct {
+	Key       string
+	Value     []byte
+	CreatedAt time.Time
+}
+```
+
+
+#### `repository.go` - defining the actions 
+
+The `secret.Repository` will expose CRUD operations against the `secrets` SQL table, similar to `users.Repository` -- however it does not expose an Update method; as secrets' values are simply overwritten if the key already exists:
+
+```go
+package secret
+
+import (
+	"context"
+)
+
+// Repository describes the actions exposed by the secrets store
+type Repository interface {
+	// Create will create (or overwrite) the secret identified by `s.Key`, for user `username`,
+	// returning an error
+	Create(ctx context.Context, username string, s *Secret) error
+	// Get fetches a secret identified by `key` for user `username`. Returns a secret and an error
+	Get(ctx context.Context, username string, key string) (*Secret, error)
+	// List returns all secrets belonging to user `username`, and an error
+	List(ctx context.Context, username string) ([]*Secret, error)
+	// Delete removes the secret identified by `key`, for user `username`. Returns an error
+	Delete(ctx context.Context, username string, key string) error
+}
+```
+
+> All repository methods accept a context as a first argument to allow retrieving more observability information, as covered further down this document.
+
+#### Secrets recap
+
+Very similar [to the User](#users-recap).
+
+_______
+
+### The `shared` package
+
+
+This package will be a top-level folder in the project named `shared`, with:
+
+```
+.
+└─ shared
+    ├─ repository.go -- lists the actions supported by the repository
+    └─ shared.go -- describes the secret entity
+```
+
+#### `shared.go` - defining entities
+
+A Shared type will contain a User (as an owner) and a list of Users with whom the secret is shared with; as the type implies such reference. It also embeds the Secret type, instead of having it as a struct element
+
+```go
+package shared
+
+import (
+	"time"
+
+	"github.com/zalgonoise/x/secr/user"
+)
+
+// Shared is metadata for a secret that a user (the owner) shares with a set of users
+// optionally within a limited period of time
+type Shared struct {
+	Key    string
+	Owner  user.User
+	Shares []user.User
+	Until  time.Time
+}
+```
+
+#### `repository.go` - defining the actions
+
+The `shared.Repository` is very simple; it basically allows sharing or unsharing a secret with one or more users, with fancy methods to:
+- share until a certain point in time
+- share for a certain period of time
+- unshare a secret from all users at once
+- fetch the secret's share metadata
+
+```go
+package shared
+
+import (
+	"context"
+	"time"
+)
+
+type Repository interface {
+	// Get fetches the secret's share metadata for a given username and secret key
+	Get(ctx context.Context, usename, secretName string) (*Shared, error)
+	// Create shares the secret identified by `secretName`, owned by `owner`, with
+	// user `target`. Returns an error
+	Create(ctx context.Context, owner, secretName string, targets ...string) error
+	// ShareUntil is similar to Share, but scopes the shared secret until `until` time
+	CreateUntil(ctx context.Context, owner, secretName string, until time.Time, targets ...string) error
+	// ShareFor is similar to ShareUntil, but scopes the shared secret for `dur` amount of time
+	CreateFor(ctx context.Context, owner, secretName string, dur time.Duration, targets ...string) error
+	// Unshare removes the user `target` from the secret share
+	Delete(ctx context.Context, owner, secretName string, targets ...string) error
+	// UnshareAll removes the shared secret completely so it's private to the owner again
+	Purge(ctx context.Context, owner, secretName string) error
+}
+```
+
+
+> All repository methods accept a context as a first argument to allow retrieving more observability information, as covered further down this document.
+
+#### Shared recap
+
+Very similar [to the User](#users-recap); but even simpler.
