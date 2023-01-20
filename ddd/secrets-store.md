@@ -356,6 +356,8 @@ type Share struct {
 
 The `shared.Repository` is just as simple as the secrets': a set of CRUD operations without Update. The persistence layer (which implements the repository) will be solely responsible of saving the shared secrets state. Any features to this implementation (sharing for a duration of time, sharing until a point in time) will be handled by the service layer.
 
+There are also two versions of the List operation, one for the shared secrets' owner, and one for the shared secrets' target user.
+
 ```go
 package shared
 
@@ -363,11 +365,14 @@ import (
 	"context"
 )
 
+// Repository describes the actions exposed by the shared secrets store
 type Repository interface {
-	// Get fetches the secret's share metadata for a given username and secret key
-	Get(ctx context.Context, username, secretName string) ([]*Share, error)
-	// List fetches all shared secrets for a given username
-	List(ctx context.Context, username string) ([]*Share, error)
+	// Get fetches the secret's share metadata for a given owner's username and secret key
+	Get(ctx context.Context, owner, secretName string) ([]*Share, error)
+	// List fetches all shared secrets for a given owner's username
+	List(ctx context.Context, owner string) ([]*Share, error)
+	// ListTarget is similar to List, but returns secrets that are shared with a target user
+	ListTarget(ctx context.Context, target string) ([]*Share, error)
 	// Create shares the secret identified by `secretName`, owned by `owner`, with
 	// user `target`. Returns an error
 	Create(ctx context.Context, s *Share) error
@@ -381,4 +386,4 @@ type Repository interface {
 
 #### Shared recap
 
-Very similar [to the User](#users-recap); but even simpler.
+Very similar [to the User](#users-recap); but even simpler (and with two "list" operations).
