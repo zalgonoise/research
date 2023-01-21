@@ -224,12 +224,12 @@ import "context"
 type Repository interface {
 	// Create will create a user `u`, returning its ID and an error
 	Create(ctx context.Context, u *User) (uint64, error)
-	// Update will update the user `username` with its updated version `updated`. Returns an error
-	Update(ctx context.Context, username string, updated *User) error
 	// Get returns the user identified by `username`, and an error
 	Get(ctx context.Context, username string) (*User, error)
 	// List returns all the users, and an error
 	List(ctx context.Context) ([]*User, error)
+	// Update will update the user `username` with its updated version `updated`. Returns an error
+	Update(ctx context.Context, username string, updated *User) error
 	// Delete removes the user identified by `username`, returning an error
 	Delete(ctx context.Context, username string) error
 }
@@ -243,6 +243,7 @@ In a nutshell this is the domain abstraction of the data stored in the database.
 
 The domain entity and repository interface state what this object (the user) is and what we can do with it.
 
+The exposed methods are pretty much CRUD operations (create-read-update-delete) with a list operation (which is basically a batch read).
 ____________
 
 ### The `secret` package
@@ -293,8 +294,8 @@ import (
 // Repository describes the actions exposed by the secrets store
 type Repository interface {
 	// Create will create (or overwrite) the secret identified by `s.Key`, for user `username`,
-	// returning an error
-	Create(ctx context.Context, username string, s *Secret) error
+	// returning its ID and an error
+	Create(ctx context.Context, username string, s *Secret) (uint64, error)
 	// Get fetches a secret identified by `key` for user `username`. Returns a secret and an error
 	Get(ctx context.Context, username string, key string) (*Secret, error)
 	// List returns all secrets belonging to user `username`, and an error
@@ -367,15 +368,15 @@ import (
 
 // Repository describes the actions exposed by the shared secrets store
 type Repository interface {
+	// Create shares the secret identified by `secretName`, owned by `owner`, with
+	// user `target`. Returns its ID and an error
+	Create(ctx context.Context, s *Share) (uint64, error)
 	// Get fetches the secret's share metadata for a given owner's username and secret key
 	Get(ctx context.Context, owner, secretName string) ([]*Share, error)
 	// List fetches all shared secrets for a given owner's username
 	List(ctx context.Context, owner string) ([]*Share, error)
 	// ListTarget is similar to List, but returns secrets that are shared with a target user
 	ListTarget(ctx context.Context, target string) ([]*Share, error)
-	// Create shares the secret identified by `secretName`, owned by `owner`, with
-	// user `target`. Returns an error
-	Create(ctx context.Context, s *Share) error
 	// Delete removes the user `target` from the secret share
 	Delete(ctx context.Context, s *Share) error
 }
