@@ -723,12 +723,251 @@ var (
 )
 ```
 
+#### BoltDB recap
 
+This is the shortest and cleanest repository implementations in this application and for the same reason it was presented first. This design model will allow the level of abstraction as you see above, where the Bolt DB implementation only cares about what is being stored / read from Bolt DB.
+
+The important take-aways from this one is that:
+
+1. This is a feature that only the service layer will use / have access to.
+2. Trying to stick to the necessary actions for the transaction to go through (on the persistence layer)
+3. Even initializing the database file (creating it, loading it) is being deferred to a different package
 
 ___________
 
 ### SQLite implementation
 
+The SQLite DB implementation will be placed in a top-level folder within the project, named `sqlite`. This folder will contain a `sqlite.go` file to initialize the DB instance, and 3 files for the 3 repositories it implements. Besides these, it will also have a `helper.go` file to aid with reusable functions, and a migrations folder for database migrations.
+
+Note that this implementation is not leveraging [`migrate`](https://github.com/golang-migrate/migrate) which is an awesome library to manage SQL migrations in Go.
+
+The `helper.go` file exposes types that are used to narrow-down the methods used for a particular action (usually the `Context` variants of SQL method calls).
+
+```
+.
+└─ sqlite
+	├─ migrations
+	│	 └─ 1672703190_initial_up.sql -- initial migration to create the database tables
+    ├─ helper.go -- contains reusable functions and types used for SQLite transactions  
+    ├─ secrets.go -- implements the secret.Repository interface
+	├─ shared.go -- implements the shared.Repository interface 
+	├─ sqlite.go -- exposes function(s) to initialize a SQLite DB instance
+    └─ users.go -- implements the user.Repository interface
+```
+
+#### Defining the initial migration
+
+The initial migration file will create the tables as described in the [Database Design section](#database-design), with the `IF NOT EXISTS` clause.
+
+This is the chance to define the unique fields which weren't yet set at first, to limit the relations between the objects within a set of boundaries. Take a look at the migration query first:
+
+```sql
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username VARCHAR(50) NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    hash TEXT NOT NULL,
+    salt TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS secrets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    name VARCHAR(250) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    
+    FOREIGN KEY (user_id) REFERENCES users (id),
+    UNIQUE(user_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS shared_secrets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_id INTEGER NOT NULL,
+    secret_id INTEGER NOT NULL,
+    shared_with INTEGER NOT NULL,
+    until TIMESTAMP,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    
+    FOREIGN KEY (owner_id) REFERENCES users (id),
+    FOREIGN KEY (secret_id) REFERENCES secrets (id),
+    FOREIGN KEY (shared_with) REFERENCES users (id),
+    UNIQUE(secret_id, shared_with)
+);
+```
+
+The migration above sets the following `UNIQUE` constraints:
+- `secrets`: secrets have unique keys per user. Means that the database does not allow `joe` to store a secret with key `access` when `access` already exists. The entry needs to be removed before added again
+- `shared_secrets`: secrets are unique per (target) user when shared. Means that the database does not allow sharing a secret with key `access` with user `joe` if such a share already exists (scoped with time for example). The entry needs to be removed before added again
+
+As for `FOREIGN KEY` constraints:
+- `secrets`: its `user_id` field will reference the `users.id` field
+- `shared_secrets`: its `owner_id` field will reference the `users.id` field
+- `shared_secrets`: its `secret_id` field will reference the `secrets.id` field
+- `shared_secrets`: its `shared_with` field will reference the `users.id` field
+
+As for the unique constraints, the service layer is responsible for fetching the data before mutating it -- so if a user tries to overwrite a secret (which is allowed), the service will first fetch it; delete it; then create it.
+
+#### Initializing a SQLite DB instance
+
+Initializing a SQLite DB instance simply takes a path to a file. This function is calling `sql.Open()`, and running the initial migration as set into `initialMigration` using `go:embed`
+
+This implementation uses [`mattn/go-sqlite3`](https://github.com/mattn/go-sqlite3) as a SQLite driver.
+
+```go
+package sqlite
+
+import (
+	"database/sql"
+
+	_ "embed"
+
+	_ "github.com/mattn/go-sqlite3"
+)
+
+//go:embed migrations/1672703190_initial_up.sql
+var initialMigration string
+
+// Open will initialize a SQLite DB based on the `.sql` file in `path`,
+// returning a pointer to a sql.DB and an error
+//
+// It executes the initial migration, as well.
+func Open(path string) (*sql.DB, error) {
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = db.Exec(initialMigration)
+	if err != nil {
+		return nil, err
+	}
+	return db, nil
+}
+```
+
+#### Defining helper functions
+
+Of course, most of these come up when you follow the same pattern more than once, be it in the same projects or over time. Some of these functions are added to the file as the logic in it is reusable across repository implementations, or simply to avoid clogging up the implemenation files. This isn't a file I start with when designing a SQL-based persistence layer, but often emerges over time when I do.
+
+Continuing with the contents of this file since they are referenced through the implementations, for better context later:
+
+**SQL Querier types**
+
+```go
+import (
+	"context"
+	"database/sql"
+)
+
+// Scanner describes an object that scans values into destination pointers
+type Scanner interface {
+	Scan(dest ...interface{}) error
+}
+
+// RowQuerier describes an object that queries a single row in a SQL database
+type RowQuerier interface {
+	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
+}
+
+// RowsQuerier describes an object that queries multiple rows in a SQL database
+type RowsQuerier interface {
+	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
+}
+
+// Executer describes an object that executes a mutation in a SQL database
+type Executer interface {
+	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
+}
+
+// Querier encapsulates a RowQuerier, RowsQuerier and Executer implementations
+type Querier interface {
+	RowQuerier
+	RowsQuerier
+	Executer
+}
+```
+
+These types narrow down the methods used when interacting with the database, often picking their `Context` method variants; often used as input parameters and returns, in functions and methods.
+
+
+**SQL-type converters**
+
+```go
+import (
+	"database/sql"
+	"time"
+
+	"golang.org/x/exp/constraints"
+)
+
+// ToSQLString converts the input string into a sql.NullString
+func ToSQLString(s string) sql.NullString {
+	return sql.NullString{String: s, Valid: s != ""}
+}
+
+// ToSQLInt64 converts the generic integer into a sql.NullInt64
+func ToSQLInt64[T constraints.Integer](v T) sql.NullInt64 {
+	return sql.NullInt64{Int64: int64(v), Valid: v >= 0}
+}
+
+// ToSQLTime converts the input time into a sql.NullTime
+func ToSQLTime(t time.Time) sql.NullTime {
+	return sql.NullTime{Time: t, Valid: t != time.Time{} && t.Unix() != 0}
+}
+```
+
+These `ToSQLXxx()` functions are often used to convert primitive types (and `time.Time`) into its `sql.NullXxx` variant. This is especially useful to quickly convert types for queries.
+
+**IsEntityFound functions**
+
+```go
+import (
+	"database/sql"
+	"fmt"
+)
+
+// IsUserFound returns an error if the entity is not found
+func IsUserFound(res sql.Result) error {
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrDBError, err)
+	}
+	if n == 0 {
+		return ErrNotFoundUser
+	}
+	return nil
+}
+
+// IsSecretFound returns an error if the entity is not found
+func IsSecretFound(res sql.Result) error {
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrDBError, err)
+	}
+	if n == 0 {
+		return ErrNotFoundSecret
+	}
+	return nil
+}
+
+// IsShareFound returns an error if the entity is not found
+func IsShareFound(res sql.Result) error {
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrDBError, err)
+	}
+	if n == 0 {
+		return ErrNotFoundShare
+	}
+	return nil
+}
+```
+
+The `IsXxxFound()` functions are wrappers for `sql.ExecContext()` returns, to verify if the issue was a target where the entry didn't exist, returning an appropriate error for the action.
+
+Note that this application does not implement any custom error type nor is it templating entities for usage in this type of errors -- otherwise it could be done in one-go with a generic function (that accepts an entity type) or with a different error handling pattern. I chose to simply re-write the same function three times since they're used very little in the implementations, and didn't seem like a solid reason to implement custom errors for this app.
 
 ___________
 
