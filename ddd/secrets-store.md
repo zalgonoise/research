@@ -1099,6 +1099,10 @@ On this method, it's not important to create a new `dbUser` object, since the `T
 
 From this query, the resulting row is being passed to a `scanUser` method which extracts the user from the `sql.Row`.
 
+> Note -- for SQL folks that are not familiar with Go: the question marks `?` in the queries represent a template, where the query will receive some data instead of that question mark token.
+>
+> The following function argument here, `ToSQLString(username)` converts a primitive `string` type into sql.NullString (a compatible type), which is parsed as `(...) WHERE u.username = 'myusername';`
+
 ```go
 // Get returns the user identified by `username`, and an error
 func (ur *userRepository) Get(ctx context.Context, username string) (*user.User, error) {
@@ -1259,8 +1263,667 @@ import (
 )
 
 var (
-	ErrDBError           = errors.New("database error")
-	ErrNotFoundUser      = errors.New("user not found")
+	ErrDBError      = errors.New("database error")
+	ErrNotFoundUser = errors.New("user not found")
+)
+```
+
+
+#### Implementing `secret.Repository`
+
+Let's mimick the flow for writing the `user.Repository` implementation.
+
+Just for context, the secrets repository stores secrets metadata, not the secret's values. That will be the service's responsibility to also call the `keys.Repository` for the same values.
+
+Here is the first layout of the `sqlite/secrets.go` file:
+
+```go
+package sqlite
+
+import (
+	"context"
+	"database/sql"
+
+	"github.com/zalgonoise/x/secr/secret"
+)
+
+
+type dbSecret struct {
+	ID        sql.NullInt64
+	Name      sql.NullString
+	CreatedAt sql.NullTime
+}
+
+var _ secret.Repository = &secretRepository{nil}
+
+type secretRepository struct {
+	db *sql.DB
+}
+
+// NewSecretRepository creates a secret.Repository from the SQL DB `db`
+func NewSecretRepository(db *sql.DB) secret.Repository {
+	return &secretRepository{db}
+}
+
+// Create will create (or overwrite) the secret identified by `s.Key`, for user `username`,
+// returning an error
+func (sr *secretRepository) Create(ctx context.Context, username string, s *secret.Secret) (uint64, error) {
+	return 0, nil
+}
+
+// Get fetches a secret identified by `key` for user `username`. Returns a secret and an error
+func (sr *secretRepository) Get(ctx context.Context, username string, key string) (*secret.Secret, error) {
+	return nil, nil
+}
+
+// List returns all secrets belonging to user `username`, and an error
+func (sr *secretRepository) List(ctx context.Context, username string) ([]*secret.Secret, error) {
+	return nil, nil
+}
+
+// Delete removes the secret identified by `key`, for user `username`. Returns an error
+func (sr *secretRepository) Delete(ctx context.Context, username string, key string) error {
+	return nil
+}
+
+func (s *dbSecret) toDomainEntity() *secret.Secret {
+	return &secret.Secret{
+		ID:        uint64(s.ID.Int64),
+		Key:       s.Name.String,
+		CreatedAt: s.CreatedAt.Time,
+	}
+}
+
+func newDBSecret(s *secret.Secret) *dbSecret {
+	return &dbSecret{
+		Name: ToSQLString(s.Key),
+	}
+}
+```
+
+Since I know it will be needed, I will now sketch out the `scanSecret()` and `scanSecrets()` methods in advance:
+
+```go
+func (sr *secretRepository) scanSecret(r Scanner) (s *secret.Secret, err error) {
+	if r == nil {
+		return nil, fmt.Errorf("%w: failed to find this secret", ErrNotFoundSecret)
+	}
+	dbs := new(dbSecret)
+	err = r.Scan(
+		&dbs.ID,
+		&dbs.Name,
+		&dbs.CreatedAt,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("%w: failed to scan DB row: %v", ErrDBError, err)
+	}
+	return dbs.toDomainEntity(), nil
+}
+
+func (sr *secretRepository) scanSecrets(rs *sql.Rows) ([]*secret.Secret, error) {
+	var secrets = []*secret.Secret{}
+
+	defer rs.Close()
+	for rs.Next() {
+		s, err := sr.scanSecret(rs)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan row: %v", err)
+		}
+		secrets = append(secrets, s)
+	}
+	return secrets, nil
+}
+```
+
+
+#### Implementing `secretRepository.Create`
+
+Knowing that the `secrets` table references the `users` table for the `users.id` value, the SQL queries raise a tiny bit in complexity. Other than that, it's the same flow as seen in the `userRepository.Create` implementation. The same is seen in the other methods, too:
+
+```go
+// Create will create (or overwrite) the secret identified by `s.Key`, for user `username`,
+// returning an error
+func (sr *secretRepository) Create(ctx context.Context, username string, s *secret.Secret) (uint64, error) {
+	dbs := newDBSecret(s)
+	res, err := sr.db.ExecContext(ctx, `
+INSERT INTO secrets (user_id, name)
+VALUES (
+	(SELECT u.id FROM users AS u WHERE u.username = ?), 
+	?)
+`, username, dbs.Name)
+
+	if err != nil {
+		return 0, fmt.Errorf("%w: failed to create secret %s: %v", ErrDBError, s.Key, err)
+	}
+
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("%w: failed to create secret %s: %v", ErrDBError, s.Key, err)
+	}
+	if id == 0 {
+		return 0, fmt.Errorf("%w: secret was not created %s", ErrDBError, s.Key)
+	}
+
+	return uint64(id), nil
+}
+```
+
+
+
+#### Implementing `secretRepository.Get`
+
+Same flow as the `userRepository.Get` implementation. I am joining the user's table to scope the query to the correct `secrets.user_id`:
+
+```go
+// Get fetches a secret identified by `key` for user `username`. Returns a secret and an error
+func (sr *secretRepository) Get(ctx context.Context, username string, key string) (*secret.Secret, error) {
+	row := sr.db.QueryRowContext(ctx, `
+SELECT s.id, s.name, s.created_at
+FROM secrets AS s
+	JOIN users AS u ON u.id = s.user_id
+WHERE u.username = ?
+	AND s.name = ?
+	`, ToSQLString(username), ToSQLString(key))
+
+	s, err := sr.scanSecret(row)
+	if err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+```
+
+#### Implementing `secretRepository.List`
+
+Exactly like the `Get` method, but only filters by `users.username`:
+
+```go
+// List returns all secrets belonging to user `username`, and an error
+func (sr *secretRepository) List(ctx context.Context, username string) ([]*secret.Secret, error) {
+	rows, err := sr.db.QueryContext(ctx, `
+SELECT s.id, s.name, s.created_at
+FROM secrets AS s
+	JOIN users AS u ON u.id = s.user_id
+WHERE u.username = ?
+		`, ToSQLString(username))
+
+	if err != nil {
+		return nil, fmt.Errorf("%w: failed to list secrets: %v", ErrDBError, err)
+	}
+
+	secrets, err := sr.scanSecrets(rows)
+	if err != nil {
+		return nil, fmt.Errorf("%w: failed to list secrets: %v", ErrDBError, err)
+	}
+
+	return secrets, nil
+}
+```
+
+#### Implementing `secretRepository.Delete`
+
+The `Delete` operation will remove the entry where the ID matches the following query, as SQLite has some limitations (that are a pain when you're used to MySQL / MariaDB). Besides this, it's a regular DB-write:
+
+```go
+// Delete removes the secret identified by `key`, for user `username`. Returns an error
+func (sr *secretRepository) Delete(ctx context.Context, username string, key string) error {
+	res, err := sr.db.ExecContext(ctx, `
+	DELETE FROM secrets WHERE id = (
+		SELECT s.id FROM secrets AS s
+			JOIN users AS u ON u.id = s.user_id
+		WHERE u.username = ? 
+			AND s.name = ?
+	)
+	`, username)
+
+	if err != nil {
+		return fmt.Errorf("%w: failed to delete secret %s: %v", ErrDBError, key, err)
+	}
+
+	err = IsSecretFound(res)
+	if err != nil {
+		return fmt.Errorf("%w: failed to delete secret %s: %v", ErrDBError, key, err)
+	}
+
+	return nil
+}
+```
+
+
+#### Defining errors and updating `import`s
+
+```go
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+
+	"github.com/zalgonoise/x/secr/secret"
+)
+
+var (
+	ErrNotFoundSecret = errors.New("secret not found")
+)
+```
+
+#### Implementing `shared.Repository`
+
+Just like the `secret.Repository` implementation, but where the SQL queries kick it up a notch. And also the domain-to-database object conversions.
+
+Mostly because this is dealing with the following characteristics:
+- the domain entity describes the targets as a list of strings (their usernames). The database entity describes the target as a single string. Means that when creating a share that has multiple targets, it will break down the (domain) share into several (db) shares and process them individually.
+- merging the resulting `dbShare` list into one or more domain shares requires processing them, evaluating if the `until` time value is the same for each target to aggregate them together (within the same key-owner object).
+
+Here is the first layout of the `sqlite/shared.go` file:
+
+```go
+package sqlite
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+
+	"github.com/zalgonoise/x/secr/shared"
+)
+
+var (
+	ErrNotFoundShare = errors.New("shared secret not found")
+)
+
+var _ shared.Repository = &sharedRepository{nil}
+
+type dbShare struct {
+	ID        sql.NullInt64
+	Secret    sql.NullString
+	Owner     sql.NullString
+	Target    sql.NullString
+	Until     sql.NullTime
+	CreatedAt sql.NullTime
+}
+
+type sharedRepository struct {
+	db *sql.DB
+}
+
+// NewSharedRepository creates a shared.Repository from the SQL DB `db`
+func NewSharedRepository(db *sql.DB) shared.Repository {
+	return &sharedRepository{db}
+}
+
+// Create shares the secret identified by `secretName`, owned by `owner`, with
+// user `target`. Returns an error
+func (sr *sharedRepository) Create(ctx context.Context, sh *shared.Share) (uint64, error) {
+	return nil, nil
+}
+
+// Get fetches the secret's share metadata for a given username and secret key
+func (sr *sharedRepository) Get(ctx context.Context, username, secretName string) ([]*shared.Share, error) {
+	return nil, nil
+}
+
+func (sr *sharedRepository) List(ctx context.Context, username string) ([]*shared.Share, error) {
+	return nil, nil
+}
+
+// ListTarget is similar to List, but returns secrets that are shared with a target user
+func (sr *sharedRepository) ListTarget(ctx context.Context, target string) ([]*shared.Share, error) {
+	return nil, nil
+}
+
+// Delete removes the user `target` from the secret share
+func (sr *sharedRepository) Delete(ctx context.Context, sh *shared.Share) error {
+	return nil
+}
+```
+
+Let's start with the basic converter functions, for `dbShare`:
+
+```go
+func newDBShare(s *shared.Share) []*dbShare {
+	var sqlT sql.NullTime
+	switch s.Until {
+	case nil:
+		sqlT = ToSQLTime(time.Now().Add(shared.DefaultShareDuration))
+	default:
+		sqlT = ToSQLTime(*s.Until)
+	}
+
+	shares := make([]*dbShare, 0, len(s.Target))
+
+	for _, t := range s.Target {
+		shares = append(shares, &dbShare{
+			Owner:  ToSQLString(s.Owner),
+			Secret: ToSQLString(s.SecretKey),
+			Target: ToSQLString(t),
+			Until:  sqlT,
+		})
+	}
+	return shares
+}
+```
+
+Breaking this down: 
+
+- Since the `*shared.Share.Until` value is nullable, the function checks on it. If it is in fact `nil` (it shouldn't as covered by the service, but worth checking), set the `until` time to now plus the default duration.
+- Create a list of `*dbShare` the same size as the targets in the input share.
+- Iterate through each target in the share appending a new `dbShare` to the list containing the owner, secret key and target.
+
+For the other way around (say, listing all secrets I've shared with other users), the logic is slightly different as it's important to check if the secrets can be merged into a domain share or not. For this, they must match the same secret key and owner, as well as `until` time:
+
+```go
+func toDomainShare(shares ...*dbShare) []*shared.Share {
+	if len(shares) == 0 {
+		return nil
+	}
+
+	s := make([]*shared.Share, 0, len(shares))
+	s = append(s, &shared.Share{
+		ID:        uint64(shares[0].ID.Int64),
+		SecretKey: shares[0].Secret.String,
+		Owner:     shares[0].Owner.String,
+		Target:    []string{shares[0].Target.String},
+		Until:     &shares[0].Until.Time,
+		CreatedAt: shares[0].CreatedAt.Time,
+	})
+
+	if len(shares) == 1 {
+		return s
+	}
+
+inputLoop:
+	for i := 1; i < len(shares); i++ {
+		for _, sh := range s {
+			if shares[i].Owner.String == sh.Owner &&
+				shares[i].Secret.String == sh.SecretKey &&
+				sh.Until.Unix() == shares[i].Until.Time.Unix() {
+				for _, t := range sh.Target {
+					if t == shares[i].Target.String {
+						continue
+					}
+					sh.Target = append(sh.Target, shares[i].Target.String)
+					continue inputLoop
+				}
+			}
+		}
+		s = append(s, &shared.Share{
+			ID:        uint64(shares[i].ID.Int64),
+			SecretKey: shares[i].Secret.String,
+			Owner:     shares[i].Owner.String,
+			Target:    []string{shares[i].Target.String},
+			Until:     &shares[i].Until.Time,
+			CreatedAt: shares[i].CreatedAt.Time,
+		})
+	}
+
+	return s
+}
+```
+
+Breaking this function down:
+- It uses a variadic parameter to accept any number of `*dbShare`, making it useful all use-cases (short-circuiting out when no shares are passed in as arguments).
+- It initializes the returned list of `*shared.Share` with the first element in the input `*dbShare`, appending it to the returned list.
+- Then, it loops over the remainder of the input (starting on index 1) where:
+  - it loops through each item already collected.
+  - checks if it matches owner, secret key **and** `until` time
+  - if passes all three checks, appends the target to the matched object
+  - otherwise, creates a new `*shared.Share` object that is appended to the output list.
+
+> `inputLoop:` is named loop in Go. This means that you can specify control flow on a specific loop by name. [See an article on this topic](https://www.ardanlabs.com/blog/2013/11/label-breaks-in-go.html)
+
+
+Having these ready, it's time to write the scanner methods, similar to the previous implementations. The major difference on this one is the converter to domain entity is not a method but a function, since we're handling a list of shares:
+
+```go
+func (sr *sharedRepository) scanShare(r Scanner) (dbs *dbShare, err error) {
+	if r == nil {
+		return nil, fmt.Errorf("%w: failed to find this share", ErrNotFoundShare)
+	}
+	dbs = new(dbShare)
+	err = r.Scan(
+		&dbs.ID,
+		&dbs.Secret,
+		&dbs.Owner,
+		&dbs.Target,
+		&dbs.Until,
+		&dbs.CreatedAt,
+	)
+	if err != nil {
+		if errors.Is(sql.ErrNoRows, err) {
+			return nil, ErrNotFoundShare
+		}
+		return nil, fmt.Errorf("%w: failed to scan DB row: %v", ErrDBError, err)
+	}
+	return dbs, nil
+}
+
+func (sr *sharedRepository) scanShares(rs *sql.Rows) ([]*shared.Share, error) {
+	var shares []*dbShare
+
+	defer rs.Close()
+	for rs.Next() {
+		dbs, err := sr.scanShare(rs)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan row: %v", err)
+		}
+		shares = append(shares, dbs)
+	}
+
+	return toDomainShare(shares...), nil
+}
+```
+
+#### Implementing `sharedRepository.Create`
+
+Taking into account the other implementations, this will be the most complex one.
+
+Shares are created usually in batches, and (for any reason) the implementation should be ready to handle errors in a transaction.
+
+For this, the `Create` (and `Delete`) methods will use a `*sql.Tx`. The `tx.Rollback()` method is deferred in case an error is raised.
+
+With this out of the way, it's a matter of iterating through the `[]*dbShare` (extracted from the input `*shared.Share`) and inserting the share in the DB. As for the share ID, only the last ID is returned (it's only used for reference, and not in any practical way).
+
+```go
+// Create shares the secret identified by `secretName`, owned by `owner`, with
+// user `target`. Returns an error
+func (sr *sharedRepository) Create(ctx context.Context, sh *shared.Share) (uint64, error) {
+	shares := newDBShare(sh)
+	tx, err := sr.db.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("failed to begin transaction: %v", err)
+	}
+
+	defer tx.Rollback()
+
+	var lastID uint64
+
+	for _, dbs := range shares {
+		res, err := tx.ExecContext(ctx, `
+		INSERT INTO shared_secrets (owner_id, secret_id, shared_with, until)
+		VALUES (
+			(SELECT id FROM users WHERE username = ?),
+			(SELECT id FROM secrets WHERE name = ?),
+			(SELECT id FROM users WHERE username = ?),
+			?
+		)
+		`, dbs.Owner, dbs.Secret, dbs.Target, dbs.Until)
+
+		if err != nil {
+			return 0, err
+		}
+		id, err := res.LastInsertId()
+		if err != nil {
+			return 0, err
+		}
+		lastID = uint64(id)
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		return 0, fmt.Errorf("failed to create shared secret: %v", err)
+	}
+	return lastID, nil
+}
+```
+
+
+#### Implementing `sharedRepository.Get`
+
+`Get` is nothing fancy besides having a longer SQL query. The query itself joins the `users` table twice for the owner and the target(s) and the `secrets` table for the secret key. 
+
+As the signature implies, it filters by the owner's name in `users.username` and the secret's key in `secrets.name`.
+
+```go
+// Get fetches the secret's share metadata for a given username and secret key
+func (sr *sharedRepository) Get(ctx context.Context, username, secretName string) ([]*shared.Share, error) {
+	rows, err := sr.db.QueryContext(ctx, `
+SELECT s.id, x.name, o.username, t.username, s.until, s.created_at
+FROM shared_secrets AS s
+	JOIN users AS o ON o.id = s.owner_id
+	JOIN users AS t ON t.id = s.shared_with
+	JOIN secrets AS x ON x.id = s.secret_id
+WHERE o.username = ?
+	AND x.name = ?
+`, ToSQLString(username), ToSQLString(secretName))
+
+	if err != nil {
+		return nil, fmt.Errorf("%w: failed to list shared secrets: %v", ErrDBError, err)
+	}
+
+	shares, err := sr.scanShares(rows)
+	if err != nil {
+		return nil, fmt.Errorf("%w: failed to list shared secrets: %v", ErrDBError, err)
+	}
+	return shares, nil
+}
+```
+
+
+#### Implementing `sharedRepository.List`
+
+Exactly the same as `Get`, but only has a filter for the owner's username.
+
+```go
+func (sr *sharedRepository) List(ctx context.Context, username string) ([]*shared.Share, error) {
+	rows, err := sr.db.QueryContext(ctx, `
+SELECT s.id, x.name, o.username, t.username, s.until, s.created_at
+FROM shared_secrets AS s
+	JOIN users AS o ON o.id = s.owner_id
+	JOIN users AS t ON t.id = s.shared_with
+	JOIN secrets AS x ON x.id = s.secret_id
+WHERE o.username = ?
+`, ToSQLString(username))
+
+	if err != nil {
+		return nil, fmt.Errorf("%w: failed to list shared secrets: %v", ErrDBError, err)
+	}
+
+	shares, err := sr.scanShares(rows)
+	if err != nil {
+		return nil, fmt.Errorf("%w: failed to list shared secrets: %v", ErrDBError, err)
+	}
+	return shares, nil
+}
+```
+
+
+
+#### Implementing `sharedRepository.ListTarget`
+
+Exactly the same as `List`, but its filter is for the **target**'s username.
+
+```go
+// ListTarget is similar to List, but returns secrets that are shared with a target user
+func (sr *sharedRepository) ListTarget(ctx context.Context, target string) ([]*shared.Share, error) {
+	rows, err := sr.db.QueryContext(ctx, `
+	SELECT s.id, x.name, o.username, t.username, s.until, s.created_at
+	FROM shared_secrets AS s
+		JOIN users AS o ON o.id = s.owner_id
+		JOIN users AS t ON t.id = s.shared_with
+		JOIN secrets AS x ON x.id = s.secret_id
+	WHERE t.username = ?
+	`, ToSQLString(target))
+
+	if err != nil {
+		return nil, fmt.Errorf("%w: failed to list shared secrets: %v", ErrDBError, err)
+	}
+
+	shares, err := sr.scanShares(rows)
+	if err != nil {
+		return nil, fmt.Errorf("%w: failed to list shared secrets: %v", ErrDBError, err)
+	}
+	return shares, nil
+}
+```
+
+
+
+#### Implementing `sharedRepository.Delete`
+
+The `Delete` call is similar to the `Create` operation, in the sense that it will break down the input `*shared.Share` into (possibly multiple) `*dbShare`, and within a SQL transaction it will delete the corresponding share.
+
+
+```go
+// Delete removes the user `target` from the secret share
+func (sr *sharedRepository) Delete(ctx context.Context, sh *shared.Share) error {
+	dbs := newDBShare(sh)
+	tx, err := sr.db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %v", err)
+	}
+
+	// defer rollback in case an error occurs
+	defer tx.Rollback()
+
+	for _, share := range dbs {
+		res, err := tx.ExecContext(ctx, `
+DELETE FROM shared_secrets WHERE id = (
+SELECT s.id FROM shared_secrets AS s
+	JOIN users AS o ON o.id = s.owner_id
+	JOIN users AS t ON t.id = s.shared_with
+	JOIN secrets AS x ON x.id = s.secret_id
+WHERE o.username = ?
+	AND x.name = ?
+	AND t.username = ?
+)`,
+			share.Owner, share.Secret, share.Target)
+
+		if err != nil {
+			return fmt.Errorf("%w: %v", ErrDBError, err)
+		}
+		err = IsShareFound(res)
+		if err != nil {
+			return fmt.Errorf("%w: %v", ErrDBError, err)
+		}
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		return fmt.Errorf("%w: shared secret was not deleted: %v", ErrDBError, err)
+	}
+	return nil
+}
+```
+
+
+#### Defining errors and updating `import`s
+
+
+```go
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/zalgonoise/x/secr/shared"
+)
+
+var (
+	ErrNotFoundShare = errors.New("shared secret not found")
 )
 ```
 
