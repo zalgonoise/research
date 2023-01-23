@@ -41,13 +41,13 @@ package user
 // User is a person (or entity) that uses the application to store
 // secrets. They will have a unique username.
 type User struct {
-	ID        uint64
-	Username  string
-	Name      string
-	Hash      string
-	Salt      string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	ID        uint64    `json:"id"`
+	Username  string    `json:"username"`
+	Name      string    `json:"name"`
+	Hash      string    `json:"-"`
+	Salt      string    `json:"-"`
+	CreatedAt time.Time `json:"created_at,omitempty"`
+	UpdatedAt time.Time `json:"updated_at,omitempty"`
 }
 ```
 
@@ -62,10 +62,10 @@ package secret
 // is a slice of bytes. Secrets are encrypted then stored with a user-scoped
 // private key
 type Secret struct {
-	ID        uint64
-	Key       string
-	Value     []byte
-	CreatedAt time.Time
+	ID        uint64    `json:"id"`
+	Key       string    `json:"key"`
+	Value     string    `json:"value"`
+	CreatedAt time.Time `json:"created_at"`
 }
 ```
 
@@ -76,19 +76,22 @@ type Secret struct {
 ```go
 package shared
 
+// DefaultShareDuration sets a maximum of 30 days for shared secrets with no defined time limit
+const DefaultShareDuration = time.Hour * 24 * 30
+
 // Shared is metadata for a secret that a user (the owner) shares with a set of users
 // optionally within a limited period of time
 type Share struct {
-	ID        uint64
-	Secret    secret.Secret
-	Owner     user.User
-	Target    []user.User
-	Until     time.Time
-	CreatedAt time.Time
+	ID        uint64     `json:"id"`
+	SecretKey string     `json:"secret_key"`
+	Owner     string     `json:"owner"`
+	Target    []string   `json:"shared_with"`
+	Until     *time.Time `json:"until,omitempty"`
+	CreatedAt time.Time  `json:"created_at"`
 }
 ```
 
-> Shared secrets will be objects wrapping a Secret, that also have an owner (User), and shares (slice of User). Optionally, a shared secret can be scoped for a period of time
+> Shared secrets will be objects containing a Secret's key, it's owner's username, and shares (slice of strings representing usernames). Optionally, a shared secret can be scoped for a period of time (a nullable value). For this application, I also define the default share duration (1 month) in case it's not defined by the caller.
 
 
 ### Database design
@@ -144,7 +147,7 @@ This application will require a CRUD implementation for both users and secrets, 
 
 As for the users repository, it will expose a complete set of CRUD operations (with `list`); but secrets will not contain an update operation -- its `create` operation will be designed to overwrite the secret if it already exists.
 
-The secrets repository will contain additional methods to share the secret until a period in time, or for a certain duration. The removal of an expired shared secret is done when reading it; so if a user lists their secrets which currently include an expired shared secret, it will be removed before the list response is returned to the caller.
+The shared repository will contain methods to share a secret with users -- optionally until a period in time, or for a certain duration. The removal of an expired shared secret is done when reading it; so if a user lists their secrets which currently include an expired shared secret, it will be removed before the read / list response is returned to the caller.
 
 ### Security
 
@@ -152,11 +155,11 @@ Initially, the users will login using a dedicated endpoint, using a username + p
 
 Creating a user does not require authentication.
 
-When a user is created, the service will create an encryption private key in the Bolt database that will be used to encrypt the user's secrets' values. Also, when created, a random 128-byte-long salt value is generated and appended to the user's password; and the resulting value is hashed. The SQLite database will store this salt and hash values, not the user's password.
+When a user is created, the service will create an encryption private key in the Bolt database that will be used to encrypt the user's secrets' values. Also, when created, a random 128-byte-long salt value is generated and appended to the user's password; and the resulting value is hashed. The SQLite database will store this salt and hash values, base64-encoded, and not the user's plaintext password.
 
-A user can only access their own resources. A secret shared by user A with user B is perceived as a (new) secret owned by user B in a read operation; which may contain an expiry. However, the actual owner is in control of this secret -- as shared secrets are read-write only for the actual owner.
+A user can only access their own resources. A secret shared by user A with user B is perceived as a (new) secret owned by user B in a read operation; which will contain an expiry. However, the actual owner is in control of this secret -- as shared secrets are read-write only for the actual owner. Shared secrets have a different key in the format of `username:secretkey`.
 
-While there is a reserved username (`root`) despite not having a roles / privileges model; the Bolt database will still store user secrets in buckets identified by the user's (internal) ID, and not their username.
+While there is a reserved username (`root`) despite not having a roles / privileges model; the Bolt database will still store user secrets in buckets identified by the user's (internal) ID, and not their username. User secrets are encrypted with AES, using a 32-byte key generated and stored when the user is first created. Like passwords, secrets will not be stored in plaintext (beyond the database's own encryption).
 
 ### Product Format
 
@@ -185,6 +188,8 @@ This package will be a top-level folder in the project named `user`, with:
 
 Just like the snippet a few blocks above, this file is very straight-forward and will contain the user entity, which describes the basic elements of a user. Additionally it will already include the Session type, which is an authenticated user (user with a session token); since this is also within the realm of the *users*. 
 
+While the entities expose the JSON tags which will be used later on in the HTTP responses, note how both the `Hash` and `Salt` fields are omitted.
+
 ```go
 package user
 
@@ -192,22 +197,25 @@ import (
 	"time"
 )
 
+// RootUsername is a reserved username for the admin deploying the application
+const RootUsername = "root"
+
 // User is a person (or entity) that uses the application to store
 // secrets. They will have a unique username.
 type User struct {
-	ID        uint64
-	Username  string
-	Name      string
-	Hash      string
-	Salt      string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	ID        uint64    `json:"id"`
+	Username  string    `json:"username"`
+	Name      string    `json:"name"`
+	Hash      string    `json:"-"`
+	Salt      string    `json:"-"`
+	CreatedAt time.Time `json:"created_at,omitempty"`
+	UpdatedAt time.Time `json:"updated_at,omitempty"`
 }
 
 // Session is an authorized user, accompanied by a JWT
 type Session struct {
-	User
-	Token string
+	User  `json:"user"`
+	Token string `json:"token"`
 }
 ```
 
@@ -272,10 +280,10 @@ import (
 // is a slice of bytes. Secrets are encrypted then stored with a user-scoped
 // private key
 type Secret struct {
-	ID        uint64
-	Key       string
-	Value     []byte
-	CreatedAt time.Time
+	ID        uint64    `json:"id"`
+	Key       string    `json:"key"`
+	Value     string    `json:"value"`
+	CreatedAt time.Time `json:"created_at"`
 }
 ```
 
@@ -327,30 +335,31 @@ This package will be a top-level folder in the project named `shared`, with:
 
 #### `shared.go` - defining entities
 
-A Share type will contain a User (as an owner) and a list of Users with whom the secret is shared with; as the type implies such reference. It also contains the actual secret being shared.
+A Share type will represent a shared secret, holding the secret key, the username of the owner, and a list of target usernames that the secret is shared with. Optionally the object can include an `Until` value to scope the access of the secret until a certain point in time. This is a nullable field, but there is a default value whenever it is not populated (of 1 month).
 
-Since Share may have different `Share.Until` values (including `nil`), it is usually returned as a list, even for a "Get" operation.
+A shared secret is usually returned in a list, even in a GET (read / list) operation.
 
 ```go
 package shared
 
 import (
 	"time"
-
-	"github.com/zalgonoise/x/secr/secret"
-	"github.com/zalgonoise/x/secr/user"
 )
+
+// DefaultShareDuration sets a maximum of 30 days for shared secrets with no defined time limit
+const DefaultShareDuration = time.Hour * 24 * 30
 
 // Shared is metadata for a secret that a user (the owner) shares with a set of users
 // optionally within a limited period of time
 type Share struct {
-	ID        uint64
-	Secret    secret.Secret
-	Owner     user.User
-	Target    []user.User
-	Until     time.Time
-	CreatedAt time.Time
+	ID        uint64     `json:"id"`
+	SecretKey string     `json:"secret_key"`
+	Owner     string     `json:"owner"`
+	Target    []string   `json:"shared_with"`
+	Until     *time.Time `json:"until,omitempty"`
+	CreatedAt time.Time  `json:"created_at"`
 }
+
 ```
 
 #### `repository.go` - defining the actions
@@ -387,7 +396,7 @@ type Repository interface {
 
 #### Shared recap
 
-Very similar [to the User](#users-recap); but even simpler (and with two "list" operations).
+Very similar [to the User](#users-recap); but even simpler (and with two "list" operations) -- one lists the owner's shared secrets, while the other (`ListTarget`) lists the secrets that are shared with a certain target user.
 
 ___________
 
@@ -431,7 +440,7 @@ const (
 	TokenKey = "active-token"
 )
 
-// UserBucket formats the input ID as a user bucket string, for the key-value store
+// UserBucket formats the input user ID as a user bucket identifier (`uid:###`)
 func UserBucket(id uint64) string {
 	return fmt.Sprintf("uid:%d", id)
 }
@@ -471,6 +480,249 @@ This section will be even simpler than the entities referred before, as it only 
 ___________
 
 ### Bolt DB implementation
+
+The Bolt DB implementation will be placed in a top-level folder within the project, named `bolt`. This will be a very clean implementation considering how Bolt makes it simple to work with transactions -- meaning that you're able to issue a batch of operations to the database and rollback if an error is raised.
+
+```
+.
+└─ bolt
+    ├─ bolt.go -- exposes function(s) to initialize a Bolt DB instance
+    └─ keys.go -- implements the keys.Repository interface
+```
+
+#### Initializing a Bolt DB instance
+
+Initializing a Bolt DB instance simply takes a path to a file. This function is simply calling `bbolt.Open()`, but its signature will be common with the SQLite implementation (later in this document); which is useful for the factory functions -- it keeps a similar structure and signature:
+
+```go
+package bolt
+
+import (
+	"go.etcd.io/bbolt"
+)
+
+// Open will initialize a Bolt DB based on the `.db` file in `path`,
+// returning a pointer to a bbolt.DB and an error
+func Open(path string) (*bbolt.DB, error) {
+	return bbolt.Open(path, 0600, nil)
+}
+```
+
+#### Implementing `keys.Repository`
+
+The keys repository will be very simple both thanks to Bolt's API and user experience -- but also because of the low complexity this feature has in the project. This repository is like a side-car to the rest of the application, as a means to isolate sensitive information in a key-value database.
+
+Usually I start by laying down the type to represent this implementation, the methods that I need to implement and a function to initialize this type:
+
+```go
+package bolt
+
+import (
+	"context"
+
+	"github.com/zalgonoise/x/secr/keys"
+	"go.etcd.io/bbolt"
+)
+
+type keysRepository struct {
+	db *bbolt.DB
+}
+
+// NewKeysRepository creates a keys.Repository from the Bolt DB `db`
+func NewKeysRepository(db *bbolt.DB) keys.Repository {
+	return &keysRepository{db}
+}
+
+// Get fetches the secret identified by `k` in the bucket `bucket`,
+// returning a slice of bytes for the value and an error
+func (ukr *keysRepository) Get(ctx context.Context, bucket, k string) ([]byte, error) {
+	return nil, nil
+}
+
+// Set creates or overwrites a secret identified by `k` with value `v`, in
+// bucket `bucket`. Returns an error
+func (ukr *keysRepository) Set(ctx context.Context, bucket, k string, v []byte) error {
+	return nil
+}
+
+// Delete removes the secret identified by `k` in bucket `bucket`, returning an error
+func (ukr *keysRepository) Delete(ctx context.Context, bucket, k string) error {
+	return nil
+}
+
+// Purge removes all the secrets in the bucket `bucket`, returning an error
+func (ukr *keysRepository) Purge(ctx context.Context, bucket string) error {
+	return nil
+}
+```
+
+From here, it's much easier to isolate the task at hand and writing the logic. This is usually the format for my `unimplemented.go` files, if existing.
+
+#### Implementing `keysRepository.Get`
+
+Like mentioned before, the Bolt instance will contain buckets (for users, as an example) that will contain key-value pairs in them (for secrets). A `Get` call to this repository will be most likely for fetching secrets but it could also be to fetch the user's encryption key, and the user's active JWT. 
+
+To ensure that the bucket and key are valid, this implementation will verify if the input strings are empty (otherwise it would be checked on the service level). Then, a read request is sent to the DB (with [`bbolt.View`](https://pkg.go.dev/go.etcd.io/bbolt#DB.View)), to read a key from an (assumed to be existing) bucket. The transaction will fail if the bucket does not exist.
+
+```go
+// Get fetches the secret identified by `k` in the bucket `bucket`,
+// returning a slice of bytes for the value and an error
+func (ukr *keysRepository) Get(ctx context.Context, bucket, k string) ([]byte, error) {
+	if bucket == "" {
+		return nil, ErrEmptyBucket
+	}
+	if k == "" {
+		return nil, ErrEmptyKey
+	}
+
+	var v []byte
+
+	err := ukr.db.View(func(tx *bbolt.Tx) error {
+		b := tx.Bucket([]byte(bucket))
+		if b == nil {
+			return ErrEmptyBucket
+		}
+		v = b.Get([]byte(k))
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, ErrEmptyBucket) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("%w: %v", ErrDBError, err)
+	}
+
+	return v, nil
+}
+```
+
+#### Implementing `keysRepository.Set`
+
+Like `Get`; this call checks for empty values in the input. The `Set` call is a DB-write, thus using the [`bbolt.Update`](https://pkg.go.dev/go.etcd.io/bbolt#DB.Update) method. Since this call will be prepared to create new buckets and key-value pairs, it calls the [`tx.CreateBucketIfNotExists`](https://pkg.go.dev/go.etcd.io/bbolt#Tx.CreateBucketIfNotExists) method, accordingly.
+
+The transaction returns an error if it fails when fetching / creating the bucket, or when storing the key-value pair.
+
+```go
+// Set creates or overwrites a secret identified by `k` with value `v`, in
+// bucket `bucket`. Returns an error
+func (ukr *keysRepository) Set(ctx context.Context, bucket, k string, v []byte) error {
+	if bucket == "" {
+		return ErrEmptyBucket
+	}
+	if k == "" {
+		return ErrEmptyKey
+	}
+	if len(v) == 0 {
+		return ErrEmptyValue
+	}
+
+	err := ukr.db.Update(func(tx *bbolt.Tx) error {
+		b, err := tx.CreateBucketIfNotExists([]byte(bucket))
+		if err != nil {
+			return fmt.Errorf("failed to get / create bucket: %v", err)
+		}
+
+		err = b.Put([]byte(k), []byte(v))
+		if err != nil {
+			return fmt.Errorf("failed to set key-value: %v", err)
+		}
+
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrDBError, err)
+	}
+	return nil
+}
+```
+
+
+#### Implementing `keysRepository.Delete` and `keysRepository.Purge`
+
+Both `Delete` and `Purge` calls are very similar, in the sense that the former removes a key-value pair while the latter removes the bucket entirely. These will be write operations, similar to the `Set` call, in which the `bbolt.Update` is called.
+
+```go
+
+// Delete removes the secret identified by `k` in bucket `bucket`, returning an error
+func (ukr *keysRepository) Delete(ctx context.Context, bucket, k string) error {
+	if bucket == "" {
+		return ErrEmptyBucket
+	}
+	if k == "" {
+		return ErrEmptyKey
+	}
+
+	err := ukr.db.Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket([]byte(bucket))
+		if b == nil {
+			return ErrEmptyBucket
+		}
+
+		err := b.Delete([]byte(k))
+		if err != nil {
+			return fmt.Errorf("failed to delete key %s in the bucket %s: %v", k, bucket, err)
+		}
+		return nil
+	})
+
+	if err != nil {
+		if errors.Is(err, ErrEmptyBucket) {
+			return err
+		}
+		return fmt.Errorf("%w: %v", ErrDBError, err)
+	}
+	return nil
+}
+```
+
+Even simpler, `Purge` doesn't even fetch the bucket:
+
+```go
+// Purge removes all the secrets in the bucket `bucket`, returning an error
+func (ukr *keysRepository) Purge(ctx context.Context, bucket string) error {
+	if bucket == "" {
+		return ErrEmptyBucket
+	}
+
+	err := ukr.db.Update(func(tx *bbolt.Tx) error {
+		err := tx.DeleteBucket([]byte(bucket))
+		if err != nil {
+			return fmt.Errorf("failed to delete the bucket %s: %v", bucket, err)
+		}
+		return nil
+	})
+
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrDBError, err)
+	}
+	return nil
+}
+```
+
+#### Defining errors and updating `import`s
+
+Since the methods refer some error types that seem to be part of this package, they need to be defined; these are super simple errors to identify the issue better with, for example, `errors.Is()`.
+
+```go
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/zalgonoise/x/secr/keys"
+	"go.etcd.io/bbolt"
+)
+
+var (
+	ErrDBError     = errors.New("database error")
+	ErrNotFoundKey = errors.New("couldn't find the key")
+	ErrEmptyKey    = errors.New("key cannot be empty")
+	ErrEmptyValue  = errors.New("username cannot be empty")
+	ErrEmptyBucket = errors.New("empty bucket")
+	ErrForbidden   = errors.New("unable to modify this resource")
+)
+```
+
 
 
 ___________
