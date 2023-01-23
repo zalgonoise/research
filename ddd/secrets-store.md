@@ -969,6 +969,301 @@ The `IsXxxFound()` functions are wrappers for `sql.ExecContext()` returns, to ve
 
 Note that this application does not implement any custom error type nor is it templating entities for usage in this type of errors -- otherwise it could be done in one-go with a generic function (that accepts an entity type) or with a different error handling pattern. I chose to simply re-write the same function three times since they're used very little in the implementations, and didn't seem like a solid reason to implement custom errors for this app.
 
+
+#### Implementing `user.Repository`
+
+A SQL implementation will need a data structure that is specific to the database, with the appropriate `sql.NullXxx` types and with the same structure as the table schema.
+
+It will also contain a type to implement the repository and function to initialize said type. Lastly, it contains a few helper methods to convert between the database data structure and the domain one, as well as functions / methods to read the rows' contents.
+
+Here is the first layout of the `sqlite/users.go` file:
+
+```go
+package sqlite
+
+import (
+	"context"
+	"database/sql"
+
+	"github.com/zalgonoise/x/secr/user"
+)
+
+type dbUser struct {
+	ID        sql.NullInt64
+	Username  sql.NullString
+	Name      sql.NullString
+	Hash      sql.NullString
+	Salt      sql.NullString
+	CreatedAt sql.NullTime
+	UpdatedAt sql.NullTime
+}
+
+var _ user.Repository = &userRepository{nil}
+
+type userRepository struct {
+	db *sql.DB
+}
+
+// NewUserRepository creates a user.Repository from the SQL DB `db`
+func NewUserRepository(db *sql.DB) user.Repository {
+	return &userRepository{db}
+}
+
+// Create will create a user `u`, returning its ID and an error
+func (ur *userRepository) Create(ctx context.Context, u *user.User) (uint64, error) {
+	return 0, nil
+}
+
+// Get returns the user identified by `username`, and an error
+func (ur *userRepository) Get(ctx context.Context, username string) (*user.User, error) {
+	return nil, nil
+}
+
+// List returns all the users, and an error
+func (ur *userRepository) List(ctx context.Context) ([]*user.User, error) {
+	return nil, nil
+}
+
+// Update will update the user `username` with its updated version `updated`. Returns an error
+func (ur *userRepository) Update(ctx context.Context, username string, updated *user.User) error {
+	return nil
+}
+
+// Delete removes the user identified by `username`, returning an error
+func (ur *userRepository) Delete(ctx context.Context, username string) error {
+	return nil
+}
+
+func (u *dbUser) toDomainEntity() *user.User {
+	return &user.User{
+		ID:        uint64(u.ID.Int64),
+		Username:  u.Username.String,
+		Name:      u.Name.String,
+		Hash:      u.Hash.String,
+		Salt:      u.Salt.String,
+		CreatedAt: u.CreatedAt.Time,
+		UpdatedAt: u.UpdatedAt.Time,
+	}
+}
+
+func newDBUser(u *user.User) *dbUser {
+	return &dbUser{
+		Username: ToSQLString(u.Username),
+		Name:     ToSQLString(u.Name),
+		Hash:     ToSQLString(u.Hash),
+		Salt:     ToSQLString(u.Salt),
+	}
+}
+
+```
+
+This is a very similar preparation to the one done in Bolt DB's [`keys.Repository` implementation](#implementing-keysrepository). The only difference is that for SQL I start by defining the `dbUser` struct, as a database entity. Since these types need to be interchangeable, I expand on that too by writing a `newDBXxx()` function and a `(x dbXxx) toDomainEntity() Xxx` method.
+
+#### Implementing `userRepository.Create`
+
+This call will push the input `*user.User` into the database, by converting it into a `dbUser` and writing its fields to the `users` table.
+
+It will return an error if the transaction fails, or if the last inserted ID errors or is zero.
+
+
+```go
+// Create will create a user `u`, returning its ID and an error
+func (ur *userRepository) Create(ctx context.Context, u *user.User) (uint64, error) {
+	dbu := newDBUser(u)
+	res, err := ur.db.ExecContext(ctx, `
+INSERT INTO users (username, name, hash, salt)
+VALUES (?, ?, ?, ?)
+`, dbu.Username, dbu.Name, dbu.Hash, dbu.Salt)
+
+	if err != nil {
+		return 0, fmt.Errorf("%w: failed to create user %s: %v", ErrDBError, u.Username, err)
+	}
+
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("%w: failed to create user %s: %v", ErrDBError, u.Username, err)
+	}
+	if id == 0 {
+		return 0, fmt.Errorf("%w: user was not created %s", ErrDBError, u.Username)
+	}
+	return uint64(id), nil
+}
+```
+
+
+#### Implementing `userRepository.Get`
+
+The `Get` method is very simple in nature, in the sense that it fetches a user identified by username `username`. This is a `SELECT` operation in SQL filtering by the username field in the users table.
+
+On this method, it's not important to create a new `dbUser` object, since the `ToSQLString()` function can be called directly on the input `username` parameter.
+
+From this query, the resulting row is being passed to a `scanUser` method which extracts the user from the `sql.Row`.
+
+```go
+// Get returns the user identified by `username`, and an error
+func (ur *userRepository) Get(ctx context.Context, username string) (*user.User, error) {
+	row := ur.db.QueryRowContext(ctx, `
+SELECT u.id, u.username, u.name, u.hash, u.salt, u.created_at, u.updated_at
+FROM users AS u
+WHERE u.username = ?
+	`, ToSQLString(username))
+
+	user, err := ur.scanUser(row)
+	if err != nil {
+		return nil, err
+	}
+	return user, nil
+}
+
+// (...)
+
+func (ur *userRepository) scanUser(r Scanner) (u *user.User, err error) {
+	if r == nil {
+		return nil, fmt.Errorf("%w: failed to find this user", ErrNotFoundUser)
+	}
+	dbu := new(dbUser)
+	err = r.Scan(
+		&dbu.ID,
+		&dbu.Username,
+		&dbu.Name,
+		&dbu.Hash,
+		&dbu.Salt,
+		&dbu.CreatedAt,
+		&dbu.UpdatedAt,
+	)
+	if err != nil {
+		if errors.Is(sql.ErrNoRows, err) {
+			return nil, ErrNotFoundUser
+		}
+		return nil, fmt.Errorf("%w: failed to scan DB row: %v", ErrDBError, err)
+	}
+	return dbu.toDomainEntity(), nil
+}
+```
+
+The `scanUser` method will be reused, thus being a separate method, and basically leverages the `Scan` method to extract the row fields into one or more target pointers.
+
+The function returns a user (already converted to a domain entity, as `*user.User`) and an error -- be it a *Not Found* error or a generic DB error.
+
+#### Implementing `userRepository.List`
+
+The `List` method is even simpler than `Get`, since it will just collect all users in the database.
+
+If the query is successful, the rows are passed onto the `scanUsers` method (below) which is sort of like a batch `scanUser` method.
+
+```go
+// List returns all the users, and an error
+func (ur *userRepository) List(ctx context.Context) ([]*user.User, error) {
+	rows, err := ur.db.QueryContext(ctx, `
+SELECT u.id, u.username, u.name, u.created_at, u.updated_at
+FROM users AS u
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("%w: failed to list users: %v", ErrDBError, err)
+	}
+
+	users, err := ur.scanUsers(rows)
+	if err != nil {
+		return nil, fmt.Errorf("%w: failed to list users: %v", ErrDBError, err)
+	}
+	return users, nil
+}
+
+// (...)
+
+
+func (ur *userRepository) scanUsers(rs *sql.Rows) ([]*user.User, error) {
+	var users = []*user.User{}
+
+	defer rs.Close()
+	for rs.Next() {
+		u, err := ur.scanUser(rs)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan row: %v", err)
+		}
+		users = append(users, u)
+	}
+	return users, nil
+}
+```
+
+`scanUsers` is a simple method that navigates through all rows in the input cursor, while extracting each user from each row, appending it to the `users` slice.
+
+
+
+#### Implementing `userRepository.Update`
+
+The `Update` operation is only intended to target the user's name changes and password changes.
+
+This isn't a dynamic operation where only the set values are updated, so the caller (in this case the service) is responsible for assuring that the name and hash data in the `updated *user.User` is not empty.
+
+Both fields are updated in the database, and an error is returned if the user is not found, or on a database error.
+
+```go
+// Update will update the user `username` with its updated version `updated`. Returns an error
+func (ur *userRepository) Update(ctx context.Context, username string, updated *user.User) error {
+	dbu := newDBUser(updated)
+	res, err := ur.db.ExecContext(ctx, `
+UPDATE users
+SET name = ?, hash = ?
+WHERE u.username = ?
+`, dbu.Name, dbu.Hash, ToSQLString(username))
+
+	if err != nil {
+		return fmt.Errorf("%w: failed to update user %s: %v", ErrDBError, username, err)
+	}
+
+	err = IsUserFound(res)
+	if err != nil {
+		return fmt.Errorf("%w: failed to update user %s: %v", ErrDBError, username, err)
+	}
+	return nil
+}
+```
+
+#### Implementing `userRepository.Delete`
+
+The `Delete` operation will remove a user by their username. It has a very similar flow as in the `Update` operation in the sense that it executes an update on the database and can return an error if the user is not found, or on a database error.
+
+```go
+// Delete removes the user identified by `username`, returning an error
+func (ur *userRepository) Delete(ctx context.Context, username string) error {
+	res, err := ur.db.ExecContext(ctx, `
+	DELETE FROM users WHERE username = ?
+	`, ToSQLString(username))
+
+	if err != nil {
+		return fmt.Errorf("%w: failed to delete user %s: %v", ErrDBError, username, err)
+	}
+
+	err = IsUserFound(res)
+	if err != nil {
+		return fmt.Errorf("%w: failed to delete user %s: %v", ErrDBError, username, err)
+	}
+
+	return nil
+}
+```
+
+
+#### Defining errors and updating `import`s
+
+```go
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+
+	"github.com/zalgonoise/x/secr/user"
+)
+
+var (
+	ErrDBError           = errors.New("database error")
+	ErrNotFoundUser      = errors.New("user not found")
+)
+```
+
 ___________
 
 ### Service preparation
