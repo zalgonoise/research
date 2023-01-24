@@ -1938,12 +1938,11 @@ Besides users and secrets and shares, the service will also handle the authoriza
 For the moment, this is the current state of the service structure (knowing that there isn't yet a service here, but the modules that it will have access to).
 
 ```
-.
-└─ service
-    ├─ user.Repository
-    ├─ secret.Repository
-    ├─ shared.Repository
-    └─ keys.Repository
+─ service
+   ├─ user.Repository
+   ├─ secret.Repository
+   ├─ shared.Repository
+   └─ keys.Repository
 ```
 
 To handle authentication and authorization, two specific packages will be added:
@@ -2336,13 +2335,12 @@ Now the service will also have access to the Authorizer, to sign JWT as needed:
 
 
 ```
-.
-└─ service
-	├─ user.Repository
-	├─ secret.Repository
-	├─ shared.Repository
-	├─ keys.Repository
-	└─ authz.Authorizer
+─ service
+   ├─ user.Repository
+   ├─ secret.Repository
+   ├─ shared.Repository
+   ├─ keys.Repository
+   └─ authz.Authorizer
 ```
 
 
@@ -2350,6 +2348,299 @@ ___________
 
 ### Service implementation
 
+The service will have access to all the repositories and will contain the core business logic for accessing and writing data within the application. To layout the implementation it is usually easier to follow the same pattern as before: define an interface, then implement it. 
+
+However due to the compexity of the `Service` interface, I will start with its type and the function to create it -- as it is exactly like the diagram above:
+
+```go
+type service struct {
+	users   user.Repository
+	secrets secret.Repository
+	shares  shared.Repository
+	keys    keys.Repository
+	auth    authz.Authorizer
+}
+
+// NewService creates a service instance from the input repositories and authorizer
+func NewService(
+	users user.Repository,
+	secrets secret.Repository,
+	shares shared.Repository,
+	keys keys.Repository,
+	auth authz.Authorizer,
+) Service {
+	return service{
+		users:   users,
+		secrets: secrets,
+		shares:  shares,
+		keys:    keys,
+		auth:    auth,
+	}
+}
+```
+
+For the `Service` interface, it will contain methods related to the actions exposed by the repositories. This doesn't mean that it will have a literal representation of the methods exposed in the repositories (e.g., it will not simply contain `UsersCreate`, `UsersGet`, etc); the service layer can expose methods that are appropriate for features of the application, which don't really require any added functionality in the corresponding repositories.
+
+An example of that is with shares, as a user can create a share (without limit), create a share with a duration, and create a share with a time limit. However the `shared.Repository` only exposes a single `Create` method. It's the responsibility of the service layer to organize the data to be queried / executed on the persistence layer.
+
+Here is the `Service` interface, containing auth, users, secrets and shares methods:
+
+```go
+import (
+	"context"
+	"time"
+
+	"github.com/zalgonoise/x/secr/authz"
+	"github.com/zalgonoise/x/secr/keys"
+	"github.com/zalgonoise/x/secr/secret"
+	"github.com/zalgonoise/x/secr/shared"
+	"github.com/zalgonoise/x/secr/user"
+)
+
+// Service defines all the exposed features and functionalities of the secrets store
+type Service interface {
+	// Login verifies the user's credentials and returns a session and an error
+	Login(ctx context.Context, username, password string) (*user.Session, error)
+	// Logout signs-out the user `username`
+	Logout(ctx context.Context, username string) error
+	// ChangePassword updates user `username`'s password after verifying the old one, returning an error
+	ChangePassword(ctx context.Context, username, password, newPassword string) error
+	// Refresh renews a user's JWT provided it is a valid one. Returns a session and an error
+	Refresh(ctx context.Context, username, token string) (*user.Session, error)
+	// Validate verifies if a user's JWT is a valid one, returning a boolean and an error
+	Validate(ctx context.Context, username, token string) (bool, error)
+	// ParseToken reads the input token string and returns the corresponding user in it, or an error
+	ParseToken(ctx context.Context, token string) (*user.User, error)
+
+	// CreateUser creates the user under username `username`, with the provided password `password` and name `name`
+	// It returns a user and an error
+	CreateUser(ctx context.Context, username, password, name string) (*user.User, error)
+	// GetUser fetches the user with username `username`. Returns a user and an error
+	GetUser(ctx context.Context, username string) (*user.User, error)
+	// ListUsers returns all the users in the directory, and an error
+	ListUsers(ctx context.Context) ([]*user.User, error)
+	// UpdateUser updates the user `username`'s name, found in `updated` user. Returns an error
+	UpdateUser(ctx context.Context, username string, updated *user.User) error
+	// DeleteUser removes the user with username `username`. Returns an error
+	DeleteUser(ctx context.Context, username string) error
+
+	// CreateSecret creates a secret with key `key` and value `value` (as a slice of bytes), for the
+	// user `username`. It returns an error
+	CreateSecret(ctx context.Context, username string, key string, value []byte) error
+	// GetSecret fetches the secret with key `key`, for user `username`. Returns a secret and an error
+	GetSecret(ctx context.Context, username string, key string) (*secret.Secret, error)
+	// ListSecrets retuns all secrets for user `username`. Returns a list of secrets and an error
+	ListSecrets(ctx context.Context, username string) ([]*secret.Secret, error)
+	// DeleteSecret removes a secret with key `key` from the user `username`. Returns an error
+	DeleteSecret(ctx context.Context, username string, key string) error
+
+	// CreateShare shares the secret with key `secretKey` belonging to user with username `owner`, with users `targets`.
+	// Returns the resulting shared secret, and an error
+	CreateShare(ctx context.Context, owner, secretKey string, targets ...string) (*shared.Share, error)
+	// ShareFor is similar to CreateShare, but sets the shared secret to expire after `dur` Duration
+	ShareFor(ctx context.Context, owner, secretKey string, dur time.Duration, targets ...string) (*shared.Share, error)
+	// ShareFor is similar to CreateShare, but sets the shared secret to expire after `until` Time
+	ShareUntil(ctx context.Context, owner, secretKey string, until time.Time, targets ...string) (*shared.Share, error)
+	// GetShare fetches the shared secret belonging to `username`, with key `secretKey`, returning it as a
+	// shared secret and an error
+	GetShare(ctx context.Context, username, secretKey string) ([]*shared.Share, error)
+	// ListShares fetches all the secrets the user with username `username` has shared with other users
+	ListShares(ctx context.Context, username string) ([]*shared.Share, error)
+	// DeleteShare removes the users `targets` from a shared secret with key `secretKey`, belonging to `username`. Returns
+	// an error
+	DeleteShare(ctx context.Context, username, secretKey string, targets ...string) error
+	// PurgeShares removes the shared secret completely, so it's no longer available to the users it was
+	// shared with. Returns an error
+	PurgeShares(ctx context.Context, username, secretKey string) error
+}
+```
+
+This seems like a lot! Well it's not as much as it seems, especially when broken down. While DDD can be a bit more verbose, I take it that the main point is to delimit the responsibility of a certain domain within that domain. This allows code to look more readable and organized as the codebase expands. Let's create a few files in the `service` directory:
+
+```
+.
+└─ service
+    ├─ secrets.go -- implements Secrets-related methods
+    ├─ service.go  -- describes the Service interface and type 
+    ├─ sessions.go -- implements Sessions-related methods
+    ├─ shares.go -- implements Shares-related methods
+    └─ users.go -- implements Users-related methods
+```
+
+Now, to implement the `Service` interface!
+
+
+#### Implementing Service Users methods
+
+Just like before, starting off with a blank canvas:
+
+```go
+package service
+
+import (
+	"context"
+
+	"github.com/zalgonoise/x/secr/user"
+)
+
+// CreateUser creates the user under username `username`, with the provided password `password` and name `name`
+// It returns a user and an error
+func (s service) CreateUser(ctx context.Context, username, password, name string) (*user.User, error) {
+	return nil, nil
+}
+
+// GetUser fetches the user with username `username`. Returns a user and an error
+func (s service) GetUser(ctx context.Context, username string) (*user.User, error) {
+	return nil, nil
+}
+
+// ListUsers returns all the users in the directory, and an error
+func (s service) ListUsers(ctx context.Context) ([]*user.User, error) {
+	return nil, nil
+}
+
+// UpdateUser updates the user `username`'s name, found in `updated` user. Returns an error
+func (s service) UpdateUser(ctx context.Context, username string, updated *user.User) error {
+	return nil
+}
+
+// DeleteUser removes the user with username `username`. Returns an error
+func (s service) DeleteUser(ctx context.Context, username string) error {
+	return nil
+}
+```
+
+#### Implementing Service Secrets methods
+
+It begins with a blank canvas:
+
+```go
+package service
+
+import (
+	"context"
+
+	"github.com/zalgonoise/x/secr/secret"
+)
+
+// CreateSecret creates a secret with key `key` and value `value` (as a slice of bytes), for the
+// user `username`. It returns an error
+func (s service) CreateSecret(ctx context.Context, username string, key string, value []byte) error {
+	return nil
+}
+
+// GetSecret fetches the secret with key `key`, for user `username`. Returns a secret and an error
+func (s service) GetSecret(ctx context.Context, username string, key string) (*secret.Secret, error) {
+	return nil, nil
+}
+
+// ListSecrets retuns all secrets for user `username`. Returns a list of secrets and an error
+func (s service) ListSecrets(ctx context.Context, username string) ([]*secret.Secret, error) {
+	return nil, nil
+}
+
+// DeleteSecret removes a secret with key `key` from the user `username`. Returns an error
+func (s service) DeleteSecret(ctx context.Context, username string, key string) error {
+	return nil
+}
+```
+
+#### Implementing Service Shares methods
+
+Let's *share* a blank canvas for this one:
+
+```go
+package service
+
+import (
+	"context"
+	"time"
+
+	"github.com/zalgonoise/x/secr/shared"
+)
+
+// CreateShare shares the secret with key `secretKey` belonging to user with username `owner`, with users `targets`.
+// Returns the resulting shared secret, and an error
+func (s service) CreateShare(ctx context.Context, owner, secretKey string, targets ...string) (*shared.Share, error) {
+	return nil, nil
+}
+
+// ShareFor is similar to CreateShare, but sets the shared secret to expire after `dur` Duration
+func (s service) ShareFor(ctx context.Context, owner, secretKey string, dur time.Duration, targets ...string) (*shared.Share, error) {
+	return nil, nil
+}
+
+// ShareFor is similar to CreateShare, but sets the shared secret to expire after `until` Time
+func (s service) ShareUntil(ctx context.Context, owner, secretKey string, until time.Time, targets ...string) (*shared.Share, error) {
+	return nil, nil
+}
+
+// GetShare fetches the shared secret belonging to `username`, with key `secretKey`, returning it as a
+// shared secret and an error
+func (s service) GetShare(ctx context.Context, username, secretKey string) ([]*shared.Share, error) {
+	return nil, nil
+}
+
+// ListShares fetches all the secrets the user with username `username` has shared with other users
+func (s service) ListShares(ctx context.Context, username string) ([]*shared.Share, error) {
+	return nil, nil
+}
+
+// DeleteShare removes the users `targets` from a shared secret with key `secretKey`, belonging to `username`. Returns
+// an error
+func (s service) DeleteShare(ctx context.Context, owner, secretKey string, targets ...string) error {
+	return nil
+}
+
+// PurgeShares removes the shared secret completely, so it's no longer available to the users it was
+// shared with. Returns an error
+func (s service) PurgeShares(ctx context.Context, owner, secretKey string) error {
+	return nil
+}
+```
+
+#### Implementing Service Sessions methods
+
+A blank canvas *session* for this implementation, too:
+
+```go
+package service
+
+import (
+	"context"
+
+	"github.com/zalgonoise/x/secr/user"
+)
+
+// Login verifies the user's credentials and returns a session and an error
+func (s service) Login(ctx context.Context, username, password string) (*user.Session, error) {
+	return nil, nil
+}
+
+// Logout signs-out the user `username`
+func (s service) Logout(ctx context.Context, username string) error {
+	return nil
+}
+
+// ChangePassword updates user `username`'s password after verifying the old one, returning an error
+func (s service) ChangePassword(ctx context.Context, username, password, newPassword string) error {
+	return nil
+}
+
+// Refresh renews a user's JWT provided it is a valid one. Returns a session and an error
+func (s service) Refresh(ctx context.Context, username, token string) (*user.Session, error) {
+	return nil, nil
+}
+
+// Validate verifies if a user's JWT is a valid one, returning a boolean and an error
+func (s service) Validate(ctx context.Context, username, token string) (bool, error) {
+	return false, nil
+}
+
+func (s service) ParseToken(ctx context.Context, token string) (*user.User, error) {
+	return nil, nil
+}
+```
 
 ___________
 
