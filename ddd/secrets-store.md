@@ -2740,14 +2740,14 @@ For this the following is required:
 	hashedPassword := sha256.Sum256(append([]byte(password), salt[:]...))
 ```
 
-5. Base64-encode both the salt and the password hash
+5. Base64-encoding both the salt and the password hash
 
 ```go
 	encSalt := base64.StdEncoding.EncodeToString(salt[:])
 	encHash := base64.StdEncoding.EncodeToString(hashedPassword[:])
 ```
 
-6. Create the (domain) user object with the input data and hash / salt
+6. Creating the (domain) user object with the input data and hash / salt
 
 ```go
 	u := &user.User{
@@ -2759,16 +2759,17 @@ For this the following is required:
 ```
 
 
-7. Create the user with this object, with a `Create` call to the user.Repository
+7. Creating the user with this object, with a `Create` call to the user.Repository
 
 ```go
 	id, err := s.users.Create(ctx, u)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create user %s: %v", username, err)
 	}
+	u.ID = id
 ```
-8. Generate a new 32-byte AES key for this user
-9. Store that key in the user's bucket (as a first entry, too), with a `Set` call to the keys.Repository
+8. Generating a new 32-byte AES key for this user
+9. Storing that key in the user's bucket (as a first entry, too), with a `Set` call to the keys.Repository
 
 ```go
 	key := crypt.New32Key()
@@ -2784,27 +2785,76 @@ There is something to consider, as I am working with Bolt DB *and* with SQLite. 
 
 Usually this is done with a service that will act as a transactioner, and has access to all repositories that the service needs. The transactioner is able to commit and rollback a transaction.
 
-For a simpler approach, I define a `func() error` to use as a rollback function. Since the user is being created in user.Repository first (to generate an ID for them), I define the opposite action in this rollback func. If the keys.Repository action fails, I can call it:
+For a simpler approach, I define a transactioner as an interface with two methods:
+- `Add(func() error)` - appends a new rollback function to the transactioner
+- `Rollback(error) error` - executes all rollback functions, and stores their errors. Returns the input error wrapping the rollback errors (if any)
+
+For this, I added the `service/transactioner.go` file, to act as such a rollback machine. The point is being able to generate a transaction, and to append rollback functions to the transaction. If an error is raised, the transaction is rolledback and an error is returned accordingly.
+
+Take a look at `service/transactioner.go`:
+
+```go
+package service
+
+import "fmt"
+
+type Transactioner interface {
+	Rollback(error) error
+	Add(RollbackFn)
+}
+
+type RollbackFn func() error
+
+type transactioner struct {
+	r   []RollbackFn
+	err error
+}
+
+func newTx() Transactioner {
+	return &transactioner{}
+}
+
+func (tx *transactioner) Rollback(input error) error {
+	for _, rb := range tx.r {
+		err := rb()
+		if err != nil {
+			if tx.err == nil {
+				tx.err = err
+				continue
+			}
+			tx.err = fmt.Errorf("%w -- %v", tx.err, err)
+		}
+	}
+	if tx.err == nil {
+		return input
+	}
+	return fmt.Errorf("%w -- rollback error: %v", input, tx.err)
+}
+
+func (tx *transactioner) Add(r RollbackFn) {
+	tx.r = append(tx.r, r)
+}
+```
+
+Since the user is being created in user.Repository first (to generate an ID for them), I define the opposite action as a transaction's rollback func. If the keys.Repository action fails, I can call it:
 
 ```go
 	id, err := s.users.Create(ctx, u)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create user %s: %v", username, err)
 	}
-	var rollback = func() error {
-		return s.users.Delete(ctx, username)
-	}
 	u.ID = id
+
+	tx := newTx()
+	tx.Add(func() error {
+		return s.users.Delete(ctx, username)
+	})
 
 	// generate a new private key for this user, and store it
 	key := crypt.New32Key()
 	err = s.keys.Set(ctx, keys.UserBucket(u.ID), keys.UniqueID, key[:])
 	if err != nil {
-		rerr := rollback()
-		if rerr != nil {
-			err = fmt.Errorf("%w: rollback error: %v", err, rerr)
-		}
-		return nil, fmt.Errorf("failed to create user %s: %v", username, err)
+		return nil, tx.Rollback(fmt.Errorf("failed to create user %s: %v", username, err))
 	}
 ```
 
@@ -2848,25 +2898,383 @@ func (s service) CreateUser(ctx context.Context, username, password, name string
 	if err != nil {
 		return nil, fmt.Errorf("failed to create user %s: %v", username, err)
 	}
-	var rollback = func() error {
-		return s.users.Delete(ctx, username)
-	}
 	u.ID = id
+
+	tx := newTx()
+	tx.Add(func() error {
+		return s.users.Delete(ctx, username)
+	})
 
 	// generate a new private key for this user, and store it
 	key := crypt.New32Key()
 	err = s.keys.Set(ctx, keys.UserBucket(u.ID), keys.UniqueID, key[:])
 	if err != nil {
-		rerr := rollback()
-		if rerr != nil {
-			err = fmt.Errorf("%w: rollback error: %v", err, rerr)
-		}
-		return nil, fmt.Errorf("failed to create user %s: %v", username, err)
+		return nil, tx.Rollback(fmt.Errorf("failed to create user %s: %v", username, err))
 	}
 
 	return u, nil
 }
 ```
+
+**`service.GetUser`**
+
+This method fetches a user from the user.Repository, by its username. It's much simpler than `CreateUser` since it just validates the username and does a `Get` call to the user.Repository:
+
+```go
+// GetUser fetches the user with username `username`. Returns a user and an error
+func (s service) GetUser(ctx context.Context, username string) (*user.User, error) {
+	if err := user.ValidateUsername(username); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidUser, err)
+	}
+
+	u, err := s.users.Get(ctx, username)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user %s: %v", username, err)
+	}
+	return u, nil
+}
+```
+
+
+**`service.ListUsers`**
+
+Same goes for `ListUsers` -- but this one doesn't require any validation:
+
+```go
+// ListUsers returns all the users in the directory, and an error
+func (s service) ListUsers(ctx context.Context) ([]*user.User, error) {
+	users, err := s.users.List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list users: %v", err)
+	}
+	return users, nil
+}
+```
+
+
+**`service.UpdateUser`**
+
+This method will be used to update a user's (general) information -- in the context of this application, this only applies to the user's name. The password changes are handled by a separate (service) method.
+
+To summarize the actions that I need to take here:
+
+1. Validating the user's input. This is the input username (identifying the user), and a user object with their updated version.
+
+For the username there is already a validator function, but for the updated object:
+
+- It must not be nil
+- Its name (and any data being updated) needs to be validated
+
+```go
+	if err := user.ValidateUsername(username); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidUser, err)
+	}
+	if updated == nil {
+		return fmt.Errorf("%w: updated user cannot be nil", ErrInvalidUser)
+	}
+	if err := user.ValidateName(updated.Name); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidName, err)
+	}
+```
+
+2. Get this user, from the user.Repository (from their username)
+
+```go
+	currentUser, err := s.users.Get(ctx, username)
+	if err != nil {
+		return fmt.Errorf("failed to fetch original user %s: %v", username, err)
+	}
+```
+
+3. Verify if there are any actual changes to be made in this action. If not, simply return without an error (the desired state is already achieved).
+
+```go
+	if updated.Name == currentUser.Name && updated.Hash == currentUser.Hash {
+		return nil
+	}
+```
+
+4. Update the user by calling the `Update` user.Repository method
+
+```go
+	err = s.users.Update(ctx, username, updated)
+	if err != nil {
+		return fmt.Errorf("failed to update user %s: %v", username, err)
+	}
+
+	return nil
+```
+
+Here's the whole thing:
+
+```go
+// UpdateUser updates the user `username`'s name, found in `updated` user. Returns an error
+func (s service) UpdateUser(ctx context.Context, username string, updated *user.User) error {
+	if err := user.ValidateUsername(username); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidUser, err)
+	}
+	if updated == nil {
+		return fmt.Errorf("%w: updated user cannot be nil", ErrInvalidUser)
+	}
+	if err := user.ValidateName(updated.Name); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidName, err)
+	}
+
+	currentUser, err := s.users.Get(ctx, username)
+	if err != nil {
+		return fmt.Errorf("failed to fetch original user %s: %v", username, err)
+	}
+	if updated.Name == currentUser.Name && updated.Hash == currentUser.Hash {
+		// no changes to be made
+		return nil
+	}
+
+	err = s.users.Update(ctx, username, updated)
+	if err != nil {
+		return fmt.Errorf("failed to update user %s: %v", username, err)
+	}
+
+	return nil
+}
+```
+
+
+
+**`service.DeleteUser`**
+
+While this method seems to only remove a user, there is also the user's secrets and shares to consider, which need to be handled appropriately. As such, to avoid cluttering the database and allowing access to secrets beyond an owner's removal, the user's shares must be removed, and then the user's secrets must be removed before finally deleting the user.
+
+These are the required actions to remove a user:
+
+1. Validate the input (the username)
+
+```go
+	if err := user.ValidateUsername(username); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidUser, err)
+	}
+```
+
+2. Fetch the user by this username. If no user is found under this username, simply return (no change in state) 
+
+```go
+	u, err := s.users.Get(ctx, username)
+	if err != nil {
+		if errors.Is(sqlite.ErrNotFoundUser, err) {
+			// no change in state
+			return nil
+		}
+		return fmt.Errorf("failed to fetch original user %s: %v", username, err)
+	}
+```
+
+3. Get all of the user's shared secrets, and remove them
+
+```go
+	shares, err := s.shares.List(ctx, username)
+	if err != nil {
+		return fmt.Errorf("failed to fetch shared secrets: %v", err)
+	}
+	for _, sh := range shares {
+		err := s.shares.Delete(ctx, sh)
+		if err != nil {
+			return err
+		}
+	}
+```
+
+4. Get all of the user's secrets, and remove them
+
+```go
+	secrets, err := s.secrets.List(ctx, username)
+	if err != nil {
+		return fmt.Errorf("failed to list user secrets: %v", err)
+	}
+	for _, secr := range secrets {
+		err := s.secrets.Delete(ctx, username, secr.Key)
+		if err != nil {
+			return err
+		}
+	}
+```
+
+5. Remove the user's private key in the keys.Repository
+
+```go
+	err = s.keys.Delete(ctx, keys.UserBucket(u.ID), keys.UniqueID)
+	if err != nil {
+		return fmt.Errorf("failed to delete user %s's key: %v", username, err)
+	}
+```
+
+6. Finally, remove the user
+
+```go
+	err = s.users.Delete(ctx, username)
+	if err != nil {
+		return fmt.Errorf("failed to delete user %s: %v", username, err)
+	}
+
+	return nil
+```
+
+This is great, but like in the `CreateUser` method, its best to rollback any changes in case an error is raised.
+
+The basic rollback model will be OK here, as it is capable of accumulating multiple `RollbackFn` and execute them all if an error is raised in any of the calls.
+
+Reviewing some of the steps with this in mind:
+
+3. Get all of the user's shared secrets, and remove them
+
+```go
+	tx := newTx()
+
+	shares, err := s.shares.List(ctx, username)
+	if err != nil {
+		return fmt.Errorf("failed to fetch shared secrets: %v", err)
+	}
+	for _, sh := range shares {
+		tx.Add(func() error {
+			_, err := s.shares.Create(ctx, sh)
+			return err
+		})
+
+		err := s.shares.Delete(ctx, sh)
+		if err != nil {
+			return tx.Rollback(fmt.Errorf("failed to remove shared secret: %v", err))
+		}
+	}
+```
+
+4. Get all of the user's secrets, and remove them
+
+```go
+	secrets, err := s.secrets.List(ctx, username)
+	if err != nil {
+		return fmt.Errorf("failed to list user secrets: %v", err)
+	}
+	for _, secr := range secrets {
+		tx.Add(func() error {
+			_, err := s.secrets.Create(ctx, username, secr)
+			return err
+		})
+
+		err := s.secrets.Delete(ctx, username, secr.Key)
+		if err != nil {
+			return tx.Rollback(fmt.Errorf("failed to remove secret: %v", err))
+		}
+	}
+```
+
+5. Remove the user's private key in the keys.Repository
+
+```go
+	upk, err := s.keys.Get(ctx, keys.UserBucket(u.ID), keys.UniqueID)
+	if err != nil {
+		return fmt.Errorf("failed to fetch user %s's key: %v", username, err)
+	}
+	tx.Add(func() error {
+		return s.keys.Set(ctx, keys.UserBucket(u.ID), keys.UniqueID, upk)
+	})
+
+	// delete private key
+	err = s.keys.Delete(ctx, keys.UserBucket(u.ID), keys.UniqueID)
+	if err != nil {
+		return tx.Rollback(fmt.Errorf("failed to delete user %s's key: %v", username, err))
+	}
+```
+
+6. Finally, remove the user
+
+```go
+	err = s.users.Delete(ctx, username)
+	if err != nil {
+		return tx.Rollback(fmt.Errorf("failed to delete user %s: %v", username, err))
+	}
+
+	return nil
+```
+
+Again, it's important to note that a (decent) transaction would work directly with the repositories, and this implementation is acting more like a batch executor (in case an error is raised). Knowing this and embracing the size of the app, this is enough.
+
+Here is the whole method body:
+
+```go
+// DeleteUser removes the user with username `username`. Returns an error
+func (s service) DeleteUser(ctx context.Context, username string) error {
+	if err := user.ValidateUsername(username); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidUser, err)
+	}
+
+	u, err := s.users.Get(ctx, username)
+	if err != nil {
+		if errors.Is(sqlite.ErrNotFoundUser, err) {
+			// no change in state
+			return nil
+		}
+		return fmt.Errorf("failed to fetch original user %s: %v", username, err)
+	}
+
+	tx := newTx()
+
+	// remove all shares
+	shares, err := s.shares.List(ctx, username)
+	if err != nil {
+		return fmt.Errorf("failed to fetch shared secrets: %v", err)
+	}
+	for _, sh := range shares {
+		tx.Add(func() error {
+			_, err := s.shares.Create(ctx, sh)
+			return err
+		})
+
+		err := s.shares.Delete(ctx, sh)
+		if err != nil {
+			return tx.Rollback(fmt.Errorf("failed to remove shared secret: %v", err))
+		}
+	}
+
+	// remove all secrets
+	secrets, err := s.secrets.List(ctx, username)
+	if err != nil {
+		return fmt.Errorf("failed to list user secrets: %v", err)
+	}
+	for _, secr := range secrets {
+		tx.Add(func() error {
+			_, err := s.secrets.Create(ctx, username, secr)
+			return err
+		})
+
+		err := s.secrets.Delete(ctx, username, secr.Key)
+		if err != nil {
+			return tx.Rollback(fmt.Errorf("failed to remove secret: %v", err))
+		}
+	}
+
+	// get user's private key for rollback func
+	upk, err := s.keys.Get(ctx, keys.UserBucket(u.ID), keys.UniqueID)
+	if err != nil {
+		return fmt.Errorf("failed to fetch user %s's key: %v", username, err)
+	}
+	tx.Add(func() error {
+		return s.keys.Set(ctx, keys.UserBucket(u.ID), keys.UniqueID, upk)
+	})
+
+	// delete private key
+	err = s.keys.Delete(ctx, keys.UserBucket(u.ID), keys.UniqueID)
+	if err != nil {
+		return tx.Rollback(fmt.Errorf("failed to delete user %s's key: %v", username, err))
+	}
+
+	// delete user
+	err = s.users.Delete(ctx, username)
+	if err != nil {
+		return tx.Rollback(fmt.Errorf("failed to delete user %s: %v", username, err))
+	}
+
+	return nil
+}
+```
+
 
 #### Implementing Service Secrets methods
 
