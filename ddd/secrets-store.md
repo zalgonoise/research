@@ -2703,6 +2703,171 @@ func (s service) DeleteUser(ctx context.Context, username string) error {
 }
 ```
 
+**`service.CreateUser`**
+
+This action receives a request from the transport layer (HTTP) and executes it after validating the input.
+
+For this the following is required:
+
+1. Validating the user's input (username, password and name), with the appropriate validators
+
+```go
+	if err := user.ValidateUsername(username); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidUser, err)
+	}
+	if err := user.ValidatePassword(password); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidPassword, err)
+	}
+	if err := user.ValidateName(name); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidName, err)
+	}
+```
+
+2. Checking if the username already exists. This will be a `Get` call to the user.Repository
+
+```go
+	_, err := s.users.Get(ctx, username)
+	if err == nil || !errors.Is(sqlite.ErrNotFoundUser, err) {
+		return nil, fmt.Errorf("failed to create user: %v", ErrAlreadyExistsUser)
+	}
+```
+
+3. Creating a new salt value
+4. Generating the password hash, from the input password with the salt appended to it
+
+```go
+	salt := crypt.NewSalt()
+	hashedPassword := sha256.Sum256(append([]byte(password), salt[:]...))
+```
+
+5. Base64-encode both the salt and the password hash
+
+```go
+	encSalt := base64.StdEncoding.EncodeToString(salt[:])
+	encHash := base64.StdEncoding.EncodeToString(hashedPassword[:])
+```
+
+6. Create the (domain) user object with the input data and hash / salt
+
+```go
+	u := &user.User{
+		Username: username,
+		Hash:     encHash,
+		Salt:     encSalt,
+		Name:     name,
+	}
+```
+
+
+7. Create the user with this object, with a `Create` call to the user.Repository
+
+```go
+	id, err := s.users.Create(ctx, u)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create user %s: %v", username, err)
+	}
+```
+8. Generate a new 32-byte AES key for this user
+9. Store that key in the user's bucket (as a first entry, too), with a `Set` call to the keys.Repository
+
+```go
+	key := crypt.New32Key()
+	err = s.keys.Set(ctx, keys.UserBucket(u.ID), keys.UniqueID, key[:])
+	if err != nil {
+		return nil, fmt.Errorf("failed to create user %s: %v", username, err)
+	}
+
+	return u, nil
+```
+
+There is something to consider, as I am working with Bolt DB *and* with SQLite. If I create the user in the user.Repository and the keys.Repository call fails, I should rollback the user creation.
+
+Usually this is done with a service that will act as a transactioner, and has access to all repositories that the service needs. The transactioner is able to commit and rollback a transaction.
+
+For a simpler approach, I define a `func() error` to use as a rollback function. Since the user is being created in user.Repository first (to generate an ID for them), I define the opposite action in this rollback func. If the keys.Repository action fails, I can call it:
+
+```go
+	id, err := s.users.Create(ctx, u)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create user %s: %v", username, err)
+	}
+	var rollback = func() error {
+		return s.users.Delete(ctx, username)
+	}
+	u.ID = id
+
+	// generate a new private key for this user, and store it
+	key := crypt.New32Key()
+	err = s.keys.Set(ctx, keys.UserBucket(u.ID), keys.UniqueID, key[:])
+	if err != nil {
+		rerr := rollback()
+		if rerr != nil {
+			err = fmt.Errorf("%w: rollback error: %v", err, rerr)
+		}
+		return nil, fmt.Errorf("failed to create user %s: %v", username, err)
+	}
+```
+
+The whole thing looks like this:
+
+```go
+// CreateUser creates the user under username `username`, with the provided password `password` and name `name`
+// It returns a user and an error
+func (s service) CreateUser(ctx context.Context, username, password, name string) (*user.User, error) {
+	if err := user.ValidateUsername(username); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidUser, err)
+	}
+	if err := user.ValidatePassword(password); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidPassword, err)
+	}
+	if err := user.ValidateName(name); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidName, err)
+	}
+
+	// check if user exists
+	_, err := s.users.Get(ctx, username)
+	if err == nil || !errors.Is(sqlite.ErrNotFoundUser, err) {
+		return nil, fmt.Errorf("failed to create user: %v", ErrAlreadyExistsUser)
+	}
+
+	// generate hash from password
+	salt := crypt.NewSalt()
+	hashedPassword := sha256.Sum256(append([]byte(password), salt[:]...))
+
+	encSalt := base64.StdEncoding.EncodeToString(salt[:])
+	encHash := base64.StdEncoding.EncodeToString(hashedPassword[:])
+
+	// create the user
+	u := &user.User{
+		Username: username,
+		Hash:     encHash,
+		Salt:     encSalt,
+		Name:     name,
+	}
+	id, err := s.users.Create(ctx, u)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create user %s: %v", username, err)
+	}
+	var rollback = func() error {
+		return s.users.Delete(ctx, username)
+	}
+	u.ID = id
+
+	// generate a new private key for this user, and store it
+	key := crypt.New32Key()
+	err = s.keys.Set(ctx, keys.UserBucket(u.ID), keys.UniqueID, key[:])
+	if err != nil {
+		rerr := rollback()
+		if rerr != nil {
+			err = fmt.Errorf("%w: rollback error: %v", err, rerr)
+		}
+		return nil, fmt.Errorf("failed to create user %s: %v", username, err)
+	}
+
+	return u, nil
+}
+```
+
 #### Implementing Service Secrets methods
 
 It begins with a blank canvas:
