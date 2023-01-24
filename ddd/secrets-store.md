@@ -2472,6 +2472,199 @@ Now, to implement the `Service` interface!
 
 #### Implementing Service Users methods
 
+Taking a look at the interface methods beforehand, it's noticeable that this is the point where the caller input is *processed* into a domain object. A method takes in some arguments like a username, password and name, and returns a `*user.User`.
+
+Validating this input happens on this layer, precisely, and input validation is the first thing that happens in all of these methods. To better organize validation, I create a `validate.go` file under a certain entity's folder:
+
+```
+.
+└─ user
+    ├─ repository.go
+    ├─ user.go 
+    └─ validate.go -- user-related validator functions
+```
+
+For users, it's important to validate the input username, name and password (as those are the customizable fields that makes up a user).
+
+Here's the username validation:
+
+```go
+package user
+
+import (
+	"errors"
+	"regexp"
+)
+
+var (
+	ErrEmptyUsername   = errors.New("username cannot be empty")
+	ErrShortUsername   = errors.New("username is too short")
+	ErrLongUsername    = errors.New("username is too long")
+	ErrInvalidUsername = errors.New("invalid username")
+)
+
+const (
+	usernameMinLength = 3
+	usernameMaxLength = 25
+)
+
+var usernameRegex = regexp.MustCompile(`[a-z0-9]+[a-z0-9\-_]+[a-z0-9]+`)
+
+// ValidateUsername verifies if the input username is valid, returning an error
+// if invalid
+func ValidateUsername(username string) error {
+	if username == "" {
+		return ErrEmptyUsername
+	}
+	if len(username) < usernameMinLength {
+		return ErrShortUsername
+	}
+	if len(username) > usernameMaxLength {
+		return ErrLongUsername
+	}
+	if match := usernameRegex.FindString(username); match != username || username == RootUsername {
+		return ErrInvalidUsername
+	}
+	return nil
+}
+```
+
+For the username, it has to be an alphanumeric string with dashes and underscores as (optional) separators. There is also a size range (between 3 and 25 characters). 
+
+This is very straight-forward using a regular expression, with some checks for length (and empty string), so that the appropriate error is returned.
+
+The name validation is very similar:
+
+```go
+import (
+	"errors"
+	"regexp"
+)
+
+
+var (
+	ErrEmptyName   = errors.New("name cannot be empty")
+	ErrShortName   = errors.New("name is too short")
+	ErrLongName    = errors.New("name is too long")
+	ErrInvalidName = errors.New("invalid name")
+)
+
+const (
+	nameMinLength = 2
+	nameMaxLength = 25
+)
+
+var nameRegex     = regexp.MustCompile(`[a-zA-Z]+[\s]?[a-zA-Z]+`)
+
+// ValidateName verifies if the input name is valid, returning an error
+// if invalid
+func ValidateName(name string) error {
+	if name == "" {
+		return ErrEmptyName
+	}
+	if len(name) < nameMinLength {
+		return ErrShortName
+	}
+	if len(name) > nameMaxLength {
+		return ErrLongName
+	}
+	if match := nameRegex.FindString(name); match != name {
+		return ErrInvalidName
+	}
+	return nil
+}
+```
+
+It's super similar to the username validation, with a different regular expression to allow capital letters and spaces (instead of underscores and dashes).
+
+The password validation has a slightly different approach:
+
+```go
+
+import (
+	"errors"
+	"regexp"
+)
+
+var (
+	ErrEmptyPassword   = errors.New("password cannot be empty")
+	ErrShortPassword   = errors.New("password is too short")
+	ErrLongPassword    = errors.New("password is too long")
+	ErrInvalidPassword = errors.New("invalid password")
+)
+
+const (
+	passwordMinLength       = 7
+	passwordMaxLength       = 300
+	PasswordCharRepeatLimit = 4
+	passwordAllowedChars    = `abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_~!@#$%^&*()=[]{}'\"|,./<>?;:`
+)
+
+var passwordCharMap = map[rune]struct{}{}
+
+func init() {
+	for _, c := range passwordAllowedChars {
+		passwordCharMap[c] = struct{}{}
+	}
+}
+
+// ValidatePassword verifies if the input password is valid, returning an error
+// if invalid
+func ValidatePassword(password string) error {
+	if password == "" {
+		return ErrEmptyPassword
+	}
+	if len(password) < passwordMinLength {
+		return ErrShortPassword
+	}
+	if len(password) > passwordMaxLength {
+		return ErrLongPassword
+	}
+	return validatePasswordCharacters(password)
+}
+
+func validatePasswordCharacters(password string) error {
+	var cur rune
+	var count int = 1
+	for _, c := range password {
+		switch c {
+		case cur:
+			count++
+			if count >= PasswordCharRepeatLimit {
+				return ErrInvalidPassword
+			}
+		default:
+			cur = c
+			count = 1
+		}
+		if _, ok := passwordCharMap[c]; !ok {
+			return ErrInvalidPassword
+		}
+	}
+	return nil
+}
+```
+
+For the user passwords, there is no need to have the overhead of a regular expression (I benchmarked it, takes about 60% the time when not using regular expressions for this one).
+
+I define all valid characters as a string constant and populate a rune-to-empty-struct map (`struct{}` has a zero-memory footprint) with these chars on an `init()` function. This allows to build the map when the package is loaded.
+
+The caracter validator function is (in a nutshell) running through all characters in the password and checking if it's present in `passwordCharMap`:
+
+```go
+	for _, c := range password {
+		// (...)
+		if _, ok := passwordCharMap[c]; !ok {
+			return ErrInvalidPassword
+		}
+	}
+	return nil
+```
+
+I also added a constraint for a user not to repeat the same character more than 3 times (so, no `000000` passwords and similar), and all of these additional checks are optional. These could be refactored in a different way (maybe to run several checks simultaneously); however validation isn't of the biggest importance in this app, at this point of implementation.
+
+Great! User validation is ready, and it's time to jump into the service implementation for user-related methods.
+
 Just like before, starting off with a blank canvas:
 
 ```go
