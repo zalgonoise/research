@@ -1219,7 +1219,7 @@ WHERE u.username = ?
 
 	err = IsUserFound(res)
 	if err != nil {
-		return fmt.Errorf("%w: failed to update user %s: %v", ErrDBError, username, err)
+		return err
 	}
 	return nil
 }
@@ -1242,7 +1242,7 @@ func (ur *userRepository) Delete(ctx context.Context, username string) error {
 
 	err = IsUserFound(res)
 	if err != nil {
-		return fmt.Errorf("%w: failed to delete user %s: %v", ErrDBError, username, err)
+		return err
 	}
 
 	return nil
@@ -1355,6 +1355,9 @@ func (sr *secretRepository) scanSecret(r Scanner) (s *secret.Secret, err error) 
 		&dbs.CreatedAt,
 	)
 	if err != nil {
+		if errors.Is(sql.ErrNoRows, err) {
+			return nil, ErrNotFoundSecret
+		}
 		return nil, fmt.Errorf("%w: failed to scan DB row: %v", ErrDBError, err)
 	}
 	return dbs.toDomainEntity(), nil
@@ -1390,7 +1393,7 @@ INSERT INTO secrets (user_id, name)
 VALUES (
 	(SELECT u.id FROM users AS u WHERE u.username = ?), 
 	?)
-`, username, dbs.Name)
+`, ToSQLString(username), dbs.Name)
 
 	if err != nil {
 		return 0, fmt.Errorf("%w: failed to create secret %s: %v", ErrDBError, s.Key, err)
@@ -1474,7 +1477,7 @@ func (sr *secretRepository) Delete(ctx context.Context, username string, key str
 		WHERE u.username = ? 
 			AND s.name = ?
 	)
-	`, username)
+	`, ToSQLString(username), ToSQLString(key))
 
 	if err != nil {
 		return fmt.Errorf("%w: failed to delete secret %s: %v", ErrDBError, key, err)
@@ -1482,7 +1485,7 @@ func (sr *secretRepository) Delete(ctx context.Context, username string, key str
 
 	err = IsSecretFound(res)
 	if err != nil {
-		return fmt.Errorf("%w: failed to delete secret %s: %v", ErrDBError, key, err)
+		return err
 	}
 
 	return nil
@@ -1895,7 +1898,7 @@ WHERE o.username = ?
 		}
 		err = IsShareFound(res)
 		if err != nil {
-			return fmt.Errorf("%w: %v", ErrDBError, err)
+			return err
 		}
 	}
 
@@ -3278,6 +3281,110 @@ func (s service) DeleteUser(ctx context.Context, username string) error {
 
 #### Implementing Service Secrets methods
 
+Just like the user, the secrets will need some sort of validation when being handled, for the keys and the values.
+
+I added a `validate.go` file under the secrets directory for this purpose: 
+
+```
+.
+└─ secret
+    ├─ repository.go
+    ├─ secret.go
+    └─ validate.go
+```
+
+Here is the keys validation:
+
+```go
+import (
+	"errors"
+	"regexp"
+	"strings"
+
+	"github.com/zalgonoise/x/secr/keys"
+	"github.com/zalgonoise/x/secr/user"
+)
+
+var (
+	ErrEmptyKey   = errors.New("key cannot be empty")
+	ErrLongKey    = errors.New("key is too long")
+	ErrInvalidKey = errors.New("invalid key")
+	ErrInvalidSharedKey = errors.New("invalid shared key")
+)
+
+const keyMaxLength   = 20
+
+var (
+	keyRegex = regexp.MustCompile(`[a-z0-9]+[a-z0-9\-_:]+[a-z0-9]+`)
+)
+
+// ValidateKey verifies if the input secret's key is valid, returning an error
+// if invalid
+func ValidateKey(key string) (bool, error) {
+	if key == "" {
+		return false, ErrEmptyKey
+	}
+	if len(key) > keyMaxLength {
+		return false, ErrLongKey
+	}
+	if match := keyRegex.FindString(key); match != key {
+		return false, ErrInvalidKey
+	}
+	if key == keys.UniqueID || key == keys.TokenKey {
+		return false, ErrEmptyKey
+	}
+	if strings.Contains(key, ":") {
+		split := strings.SplitN(key, ":", 1)
+		if len(split) != 2 {
+			return false, ErrInvalidSharedKey
+		}
+		if err := user.ValidateUsername(split[0]); err != nil {
+			return false, err
+		}
+		if isShared, err := ValidateKey(split[1]); err != nil || isShared {
+			return false, err
+		}
+		return true, nil
+	}
+	return false, nil
+}
+```
+
+
+Keys will have a limit in size, and a regex matcher similar to the usernames (that also allows `:`, more on that soon). Also, secret keys must not contain the reserved keys for JWT and user's private keys. As a bit of sugar, this validator will return a boolean and an error.
+
+The thing about `:` in secret keys is that later, in the shared package and List / Get operations, shared secrets append the owner's username to the key with `:` as separator (like `joe:secret` is a secret key visible to users that `joe` has shared `secret` with). The boolean from this validator is an `isShared` boolean, determining if the `:` is present thus if it is a shared secret.
+
+> Note: for shared secrets, as the key is validated and determined there is a `:`; the secret is split by this symbol. The first half is validated as a username, and the second half is validated as a secret key, whereas this one must not be a shared key.
+
+
+Here is the values validator: 
+
+```go
+var (
+	ErrEmptyValue = errors.New("value cannot be empty")
+	ErrLongValue  = errors.New("value is too long")
+)
+
+const valueMaxLength = 8192
+
+// ValidateValue verifies if the input secret's value is valid, returning an error
+// if invalid
+func ValidateValue(value []byte) error {
+	if len(value) == 0 {
+		return ErrEmptyValue
+	}
+	if len(value) > valueMaxLength {
+		return ErrLongValue
+	}
+	return nil
+}
+```
+
+Validating the secret values is merely whether the value is empty, or if it exceeds a maximum length (currently set to 8kb).
+
+Having the secrets validation done, means it is time to jump into the service implementation.
+
 It begins with a blank canvas:
 
 ```go
@@ -3307,6 +3414,369 @@ func (s service) ListSecrets(ctx context.Context, username string) ([]*secret.Se
 
 // DeleteSecret removes a secret with key `key` from the user `username`. Returns an error
 func (s service) DeleteSecret(ctx context.Context, username string, key string) error {
+	return nil
+}
+```
+
+
+**`service.CreateSecret`**
+
+This action stores (or overwrites) a secret
+
+
+```go
+// CreateSecret creates a secret with key `key` and value `value` (as a slice of bytes), for the
+// user `username`. It returns an error
+func (s service) CreateSecret(ctx context.Context, username string, key string, value []byte) error {
+	if err := user.ValidateUsername(username); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidUser, err)
+	}
+	if isShared, err := secret.ValidateKey(key); err != nil || isShared {
+		return fmt.Errorf("%w: %v", ErrInvalidKey, err)
+	}
+	if err := secret.ValidateValue(value); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidValue, err)
+	}
+
+	u, err := s.users.Get(ctx, username)
+	if err != nil {
+		return fmt.Errorf("failed to fetch user: %v", err)
+	}
+
+	tx := newTx()
+
+	// check if secret already exists
+	oldSecr, err := s.secrets.Get(ctx, username, key)
+	if err != nil && !errors.Is(sqlite.ErrNotFoundSecret, err) {
+		return fmt.Errorf("failed to fetch previous secret under this key: %v", err)
+	}
+	if oldSecr != nil {
+		// remove old shares if they exist
+		shares, err := s.shares.Get(ctx, username, oldSecr.Key)
+		if err != nil && !errors.Is(sqlite.ErrNotFoundShare, err) {
+			return fmt.Errorf("failed to fetch previous shared secrets: %v", err)
+		}
+		for _, sh := range shares {
+			tx.Add(func() error {
+				_, err := s.shares.Create(ctx, sh)
+				return err
+			})
+			err := s.shares.Delete(ctx, sh)
+			if err != nil {
+				return tx.Rollback(fmt.Errorf("failed to remove old share: %v", err))
+			}
+		}
+
+		// get encrypted value for existing secret (for RollbackFn)
+		val, err := s.keys.Get(ctx, keys.UserBucket(u.ID), key)
+		if err != nil {
+			return tx.Rollback(fmt.Errorf("failed to fetch old secret's value: %v", err))
+		}
+
+		tx.Add(func() error {
+			return s.keys.Set(ctx, keys.UserBucket(u.ID), key, val)
+		})
+
+		// remove it
+		err = s.keys.Delete(ctx, keys.UserBucket(u.ID), key)
+		if err != nil {
+			return tx.Rollback(fmt.Errorf("failed to remove old secret's value: %v", err))
+		}
+
+		tx.Add(func() error {
+			_, err := s.secrets.Create(ctx, username, oldSecr)
+			return err
+		})
+
+		// remove the secret's metadata
+		err = s.secrets.Delete(ctx, username, key)
+		if err != nil {
+			return tx.Rollback(fmt.Errorf("failed to remove old secret: %v", err))
+		}
+	}
+
+	// encrypt secret with user's key:
+	// fetch the key
+	cipherKey, err := s.keys.Get(ctx, keys.UserBucket(u.ID), keys.UniqueID)
+	if err != nil {
+		return tx.Rollback(fmt.Errorf("failed to get user's private key: %v", err))
+	}
+
+	// encrypt value with user's private key
+	cipher := crypt.NewCipher(cipherKey)
+	encValue, err := cipher.Encrypt(value)
+	if err != nil {
+		return tx.Rollback(fmt.Errorf("failed to encrypt value: %v", err))
+	}
+
+	// store encrypted value
+	err = s.keys.Set(ctx, keys.UserBucket(u.ID), key, encValue)
+	if err != nil {
+		return tx.Rollback(fmt.Errorf("failed to store the secret: %v", err))
+	}
+	tx.Add(func() error {
+		if oldSecr == nil {
+			return s.keys.Delete(ctx, keys.UserBucket(u.ID), key)
+		}
+		return nil
+	})
+
+	secr := &secret.Secret{
+		Key: key,
+	}
+
+	// create secret
+	id, err := s.secrets.Create(ctx, username, secr)
+	if err != nil {
+		return tx.Rollback(fmt.Errorf("failed to create the secret: %v", err))
+	}
+	secr.ID = id
+
+	return nil
+}
+```
+
+**`service.GetSecret`**
+
+```go
+// GetSecret fetches the secret with key `key`, for user `username`. Returns a secret and an error
+func (s service) GetSecret(ctx context.Context, username string, key string) (*secret.Secret, error) {
+	if err := user.ValidateUsername(username); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidUser, err)
+	}
+	isShared, err := secret.ValidateKey(key)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidKey, err)
+	}
+
+	// handle fetching an owned secret vs a shared secret
+	if isShared {
+		userAndKey := strings.Split(key, ":")
+		return s.getSharedSecret(ctx, userAndKey[0], userAndKey[1], username)
+	}
+
+	return s.getSecret(ctx, username, key)
+}
+
+func (s service) getSecret(ctx context.Context, username, key string) (*secret.Secret, error) {
+	u, err := s.users.Get(ctx, username)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch user: %v", err)
+	}
+
+	// fetch secret('s metadata )
+	secr, err := s.secrets.Get(ctx, username, key)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch the secret: %v", err)
+	}
+
+	// fetch user's private key to decode encrypted secret
+	cipherKey, err := s.keys.Get(ctx, keys.UserBucket(u.ID), keys.UniqueID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch the user's private key: %v", err)
+	}
+	cipher := crypt.NewCipher(cipherKey)
+
+	// fetch secret's value
+	encValue, err := s.keys.Get(ctx, keys.UserBucket(u.ID), key)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch the secret: %v", err)
+	}
+
+	// decrypt value with user's private key
+	decValue, err := cipher.Decrypt(encValue)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decrypt value: %v", err)
+	}
+
+	secr.Value = string(decValue)
+	return secr, nil
+}
+
+func (s service) getSharedSecret(ctx context.Context, owner, key, target string) (*secret.Secret, error) {
+	// get the original share (as if it was the owner)
+	sh, err := s.shares.Get(ctx, owner, key)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch shared secret metadata: %v", err)
+	}
+
+	var validShare *shared.Share
+	for _, share := range sh {
+		// validate share's deadline first
+		if share.Until != nil {
+			if time.Now().After(*share.Until) {
+				// remove it if expired
+				err := s.shares.Delete(ctx, share)
+				if err != nil {
+					return nil, fmt.Errorf("failed to remove expired shared secret: %v", err)
+				}
+				continue
+			}
+		}
+		// check if the caller is one of the targets
+		for _, t := range share.Target {
+			if t == target {
+				validShare = share
+				break
+			}
+		}
+	}
+
+	// no share found, caller requests a share that doesn't exist
+	// or doesn't have access to
+	if validShare == nil {
+		return nil, ErrZeroShares
+	}
+
+	// fetch the deciphered secret
+	secr, err := s.getSecret(ctx, owner, key)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch shared secret: %v", err)
+	}
+	// erase creation time; set key as `user:key`
+	secr.CreatedAt = time.Time{}
+	secr.Key = fmt.Sprintf("%s:%s", owner, secr.Key)
+	return secr, nil
+}
+```
+
+**`service.ListSecrets`**
+
+```go
+// ListSecrets retuns all secrets for user `username`. Returns a list of secrets and an error
+func (s service) ListSecrets(ctx context.Context, username string) ([]*secret.Secret, error) {
+	if err := user.ValidateUsername(username); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidUser, err)
+	}
+
+	u, err := s.users.Get(ctx, username)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch user: %v", err)
+	}
+
+	// fetch secret('s metadata )
+	secrets, err := s.secrets.List(ctx, username)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list the user's secrets: %v", err)
+	}
+
+	// fetch user's private key to decode encrypted secret
+	cipherKey, err := s.keys.Get(ctx, keys.UserBucket(u.ID), keys.UniqueID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch the user's private key: %v", err)
+	}
+	cipher := crypt.NewCipher(cipherKey)
+
+	// fetch and decode the value for each secret
+	for _, secr := range secrets {
+		// fetch secret's value
+		encValue, err := s.keys.Get(ctx, keys.UserBucket(u.ID), secr.Key)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch the secret: %v", err)
+		}
+
+		// decrypt value with user's private key
+		decValue, err := cipher.Decrypt(encValue)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decrypt value: %v", err)
+		}
+
+		secr.Value = string(decValue)
+	}
+
+	// aggregate secrets that are shared with this user
+	sharedSecrets, err := s.shares.ListTarget(ctx, username)
+	if err != nil {
+		return secrets, fmt.Errorf("failed to fetch secrets shared with %s: %v", username, err)
+	}
+	for _, sh := range sharedSecrets {
+		// extract secret from shared secret
+		sharedSecr, err := s.getSharedSecret(ctx, sh.Owner, sh.SecretKey, username)
+		if err != nil {
+			if errors.Is(ErrZeroShares, err) {
+				continue
+			}
+			return secrets, fmt.Errorf("failed to fetch secrets shared with %s: %v", username, err)
+		}
+		// append results
+		secrets = append(secrets, sharedSecr)
+	}
+
+	return secrets, nil
+}
+```
+
+**`service.DeleteSecret`**
+
+```go
+// DeleteSecret removes a secret with key `key` from the user `username`. Returns an error
+func (s service) DeleteSecret(ctx context.Context, username string, key string) error {
+	if err := user.ValidateUsername(username); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidUser, err)
+	}
+	if isShared, err := secret.ValidateKey(key); err != nil || isShared {
+		return fmt.Errorf("%w: %v", ErrInvalidKey, err)
+	}
+
+	u, err := s.users.Get(ctx, username)
+	if err != nil {
+		return fmt.Errorf("failed to fetch user: %v", err)
+	}
+
+	tx := newTx()
+
+	// remove shares for this secret
+	shares, err := s.shares.Get(ctx, username, key)
+	if err != nil && !errors.Is(sqlite.ErrNotFoundShare, err) {
+		return fmt.Errorf("failed to list shared secrets: %v", err)
+	}
+	for _, sh := range shares {
+		tx.Add(func() error {
+			_, err := s.shares.Create(ctx, sh)
+			return err
+		})
+		err := s.shares.Delete(ctx, sh)
+		if err != nil {
+			return tx.Rollback(fmt.Errorf("failed to remove shared secret: %v", err))
+		}
+	}
+
+	// fetch the encrypted secret (for RollbackFn)
+	secr, err := s.keys.Get(ctx, keys.UserBucket(u.ID), key)
+	if err != nil {
+		if errors.Is(bolt.ErrEmptyBucket, err) {
+			// nothing to delete, no changes in state
+			return nil
+		}
+		return tx.Rollback(fmt.Errorf("failed to fetch the secret: %v", err))
+	}
+	tx.Add(func() error {
+		return s.keys.Set(ctx, keys.UserBucket(u.ID), key, secr)
+	})
+
+	// delete it
+	err = s.keys.Delete(ctx, keys.UserBucket(u.ID), key)
+	if err != nil {
+		return tx.Rollback(fmt.Errorf("failed to remove secret: %v", err))
+	}
+
+	// fetch the secret's metadata (for RollbackFn)
+	secretMeta, err := s.secrets.Get(ctx, username, key)
+	if err != nil {
+		return tx.Rollback(fmt.Errorf("failed to fetch secret: %v", err))
+	}
+
+	tx.Add(func() error {
+		_, err := s.secrets.Create(ctx, username, secretMeta)
+		return err
+	})
+
+	// delete it
+	err = s.secrets.Delete(ctx, username, key)
+	if err != nil {
+		return tx.Rollback(fmt.Errorf("failed to remove secret: %v", err))
+	}
+
 	return nil
 }
 ```
