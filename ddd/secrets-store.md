@@ -5388,7 +5388,7 @@ The other `ghttp` features used on this app will be covered on-the-go
 
 To map the endpoints I first take a look at the Service interface and try to sketch out what seems the most reasonable (how should paths cascade, the HTTP verbs used, the superficial stuff). Here is the sketch for the paths, mapped to other paths or HTTP verbs, pointing to service methods:
 
-[HTTP Schema](./media/Secr_HTTP_Endpoints.jpg)
+![HTTP Schema](./media/Secr_HTTP_Endpoints.jpg)
 
 #### Handling endpoints that require auth
 ___________
