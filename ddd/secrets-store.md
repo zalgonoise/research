@@ -3702,6 +3702,8 @@ func (s service) CreateSecret(ctx context.Context, username string, key string, 
 }
 ```
 
+I would probably mark as a post-MVP task to refactor this method into smaller functions to allow a cleaner presentation.
+
 **`service.GetSecret`**
 
 Fetching a secret has simply one thing to consider; whether the target secret is shared or not. If it is shared, the key is expected to be in a `username:key` format, which will allow the secret key to be validated accordingly. Afterall, this will be how shared secrets appear to users.
@@ -3714,6 +3716,7 @@ The `GetSecret` method will simply validate the user's input and depending on th
 
 `getSharedSecret` validates the request by fetching the owner's shares for this secret, and checking whether the share is not expired, and if the user is a target. If they are, then the secret is deciphered with a `getSecret` call, and its key updated to the `username:key` format.
 
+Below is how `GetSecret` looks like. When the secret key validation indicates that it is a shared secret, the key is split into username and key; which is processed with `getSharedSecret`. Otherwise it just goes through the `getSecret` routine:
 
 ```go
 // GetSecret fetches the secret with key `key`, for user `username`. Returns a secret and an error
@@ -3734,8 +3737,66 @@ func (s service) GetSecret(ctx context.Context, username string, key string) (*s
 
 	return s.getSecret(ctx, username, key)
 }
+```
 
-func (s service) getSecret(ctx conandtext.Context, username, key string) (*secret.Secret, error) {
+As for `getSecret`, it has the same signature as `GetSecret`:
+
+```go
+(s service) getSecret(ctx context.Context, username, key string) (*secret.Secret, error)
+```
+
+1. First, it must fetch the user
+
+```go
+	u, err := s.users.Get(ctx, username)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch user: %v", err)
+	}
+```
+
+2. Then, the secret's metadata:
+
+```go
+	secr, err := s.secrets.Get(ctx, username, key)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch the secret: %v", err)
+	}
+```
+
+3. Also, the user's cipher key:
+
+```go
+	cipherKey, err := s.keys.Get(ctx, keys.UserBucket(u.ID), keys.UniqueID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch the user's private key: %v", err)
+	}
+	cipher := crypt.NewCipher(cipherKey)
+```
+
+4. And finally, the (encrypted) secret's value:
+
+```go
+	encValue, err := s.keys.Get(ctx, keys.UserBucket(u.ID), key)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch the secret: %v", err)
+	}
+```
+
+5. With all the needed data, it's a matter of deciphering the secret and composing the returned object:
+
+```go
+	decValue, err := cipher.Decrypt(encValue)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decrypt value: %v", err)
+	}
+
+	secr.Value = string(decValue)
+```
+
+This is how `getSecret` looks like as a whole:
+
+```go
+func (s service) getSecret(ctx context.Context, username, key string) (*secret.Secret, error) {
 	u, err := s.users.Get(ctx, username)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch user: %v", err)
@@ -3769,7 +3830,94 @@ func (s service) getSecret(ctx conandtext.Context, username, key string) (*secre
 	secr.Value = string(decValue)
 	return secr, nil
 }
+```
 
+Now for the `getSharedSecret` method; its signature is accepting an owner username, a secret key and a target username:
+
+```go
+(s service) getSharedSecret(ctx context.Context, owner, key, target string) (*secret.Secret, error)
+```
+
+Now for the shared secret routine:
+
+1. Fetch the share metadata on behalf of the owner, for the input secret key
+
+```go
+	sh, err := s.shares.Get(ctx, owner, key)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch shared secret metadata: %v", err)
+	}
+```
+
+2. Iterate through all the shares to find the target. For this I initialize a pointer to a `shared.Share` which I will use to store a valid share if found.
+
+```go
+	var validShare *shared.Share
+	for _, share := range sh {
+	// (...)
+	}
+```
+
+3. First thing's first, even before looking into the targets, it's important to validate the share's expiry date. The plan was to remove expired shares on read actions, and this is one of them. 
+
+```go
+	for _, share := range sh {
+		if share.Until != nil {
+			if time.Now().After(*share.Until) {
+				err := s.shares.Delete(ctx, share)
+				if err != nil {
+					return nil, fmt.Errorf("failed to remove expired shared secret: %v", err)
+				}
+				continue
+			}
+		}
+	// (...)
+	}
+```
+
+4. Then, looking for the requesting user in the `share.Target` list of usernames. If there is a match, the `validShare` pointer is set
+
+
+```go
+	var validShare *shared.Share
+	for _, share := range sh {
+	// (...)
+		for _, t := range share.Target {
+			if t == target {
+				validShare = share
+				break
+			}
+		}	
+	}
+```
+
+5. Having gone through the shares, I can evaluate the state of `validShare`:
+
+```go
+	if validShare == nil {
+		return nil, ErrZeroShares
+	}
+```
+
+6. With a non-nil `validShare`, however, I can continue fetching the actual secret. For this I will just use the `getSecret` method on behalf of the owner
+
+```go
+	secr, err := s.getSecret(ctx, owner, key)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch shared secret: %v", err)
+	}
+```
+
+7. Lastly, I erase the creation date (as the only form of PII besides the secret's value), as it only concerns the owner and set the key to a `username:key` format:
+
+```go
+	secr.CreatedAt = time.Time{}
+	secr.Key = fmt.Sprintf("%s:%s", owner, secr.Key)
+```
+
+Here is how the whole thing looks:
+
+```go
 func (s service) getSharedSecret(ctx context.Context, owner, key, target string) (*secret.Secret, error) {
 	// get the original share (as if it was the owner)
 	sh, err := s.shares.Get(ctx, owner, key)
@@ -3819,6 +3967,90 @@ func (s service) getSharedSecret(ctx context.Context, owner, key, target string)
 
 **`service.ListSecrets`**
 
+This operation does the same as a `GetSecret` operation, but obviously as a batch process (for all of the input user's owned secrets and secrets shared with them).
+
+There are a lot of similarities from the previous chapter, with differences in the repository methods being called:
+
+1. Validation, validation, validation!
+
+```go
+	if err := user.ValidateUsername(username); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidUser, err)
+	}
+```
+
+2. Fetching the user:
+
+```go
+	u, err := s.users.Get(ctx, username)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch user: %v", err)
+	}
+```
+
+3. And fetching *all* of the secrets' metadata (with `secrets.List`)
+
+```go
+	secrets, err := s.secrets.List(ctx, username)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list the user's secrets: %v", err)
+	}
+```
+
+4. Fetch the user's cipher key
+
+```go
+	cipherKey, err := s.keys.Get(ctx, keys.UserBucket(u.ID), keys.UniqueID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch the user's private key: %v", err)
+	}
+	cipher := crypt.NewCipher(cipherKey)
+```
+
+5. Then, having already a list of `*secret.Secret`, I can decode the secret's values in-place, when iterating through them:
+
+```go
+	for _, secr := range secrets {
+		encValue, err := s.keys.Get(ctx, keys.UserBucket(u.ID), secr.Key)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch the secret: %v", err)
+		}
+
+		decValue, err := cipher.Decrypt(encValue)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decrypt value: %v", err)
+		}
+
+		secr.Value = string(decValue)
+	}
+```
+
+6. And now for the shared secrets I can call `shares.ListTarget`, to fetch all secrets shared with this user:
+
+```go
+	sharedSecrets, err := s.shares.ListTarget(ctx, username)
+	if err != nil {
+		return secrets, fmt.Errorf("failed to fetch secrets shared with %s: %v", username, err)
+	}
+```
+
+7. When iterating through all shares, I can call `getSharedSecret` for each share. If the error is not having any shares (expired, for instance), just continue. Otherwise I can return the user's secrets *and* the error. If all goes well, each (shared) secret is appended to the returned list of secrets:
+
+```go
+	for _, sh := range sharedSecrets {
+		sharedSecr, err := s.getSharedSecret(ctx, sh.Owner, sh.SecretKey, username)
+		if err != nil {
+			if errors.Is(ErrZeroShares, err) {
+				continue
+			}
+			return secrets, fmt.Errorf("failed to fetch secrets shared with %s: %v", username, err)
+		}
+		secrets = append(secrets, sharedSecr)
+	}
+```
+
+Here is how the entire thing looks:
+
 ```go
 // ListSecrets retuns all secrets for user `username`. Returns a list of secrets and an error
 func (s service) ListSecrets(ctx context.Context, username string) ([]*secret.Secret, error) {
@@ -3831,7 +4063,7 @@ func (s service) ListSecrets(ctx context.Context, username string) ([]*secret.Se
 		return nil, fmt.Errorf("failed to fetch user: %v", err)
 	}
 
-	// fetch secret('s metadata )
+	// fetch secrets(' metadata )
 	secrets, err := s.secrets.List(ctx, username)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list the user's secrets: %v", err)
@@ -3884,6 +4116,97 @@ func (s service) ListSecrets(ctx context.Context, username string) ([]*secret.Se
 ```
 
 **`service.DeleteSecret`**
+
+Deleting a secret will involve a transaction, since its shares will also be removed; so it's nice to consider rolling back any deletions in case an error occurs.
+
+1. It all starts with validation (for username and secret key):
+
+```go
+	if err := user.ValidateUsername(username); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidUser, err)
+	}
+	if isShared, err := secret.ValidateKey(key); err != nil || isShared {
+		return fmt.Errorf("%w: %v", ErrInvalidKey, err)
+	}
+```
+
+2. Then, fetching the user:
+
+```go
+	u, err := s.users.Get(ctx, username)
+	if err != nil {
+		return fmt.Errorf("failed to fetch user: %v", err)
+	}
+```
+
+3. To remove the shares, I will fetch them first, to iterate over all of the secret's shares, deleting them as I go:
+
+```go
+	tx := newTx()
+	shares, err := s.shares.Get(ctx, username, key)
+	if err != nil && !errors.Is(sqlite.ErrNotFoundShare, err) {
+		return fmt.Errorf("failed to list shared secrets: %v", err)
+	}
+	for _, sh := range shares {
+		tx.Add(func() error {
+			_, err := s.shares.Create(ctx, sh)
+			return err
+		})
+		err := s.shares.Delete(ctx, sh)
+		if err != nil {
+			return tx.Rollback(fmt.Errorf("failed to remove shared secret: %v", err))
+		}
+	}
+```
+
+4. Now, to delete the secret's value from the `keys.Repository`, I will fetch it first (for the rollback function). I won't decrypt it for this action:
+
+```go
+	secr, err := s.keys.Get(ctx, keys.UserBucket(u.ID), key)
+	if err != nil {
+		if errors.Is(bolt.ErrEmptyBucket, err) {
+			// nothing to delete, no changes in state
+			return nil
+		}
+		return tx.Rollback(fmt.Errorf("failed to fetch the secret: %v", err))
+	}
+	tx.Add(func() error {
+		return s.keys.Set(ctx, keys.UserBucket(u.ID), key, secr)
+	})
+```
+
+5. Delete the secret's value
+
+```go
+	err = s.keys.Delete(ctx, keys.UserBucket(u.ID), key)
+	if err != nil {
+		return tx.Rollback(fmt.Errorf("failed to remove secret: %v", err))
+	}
+```
+
+6. Now the same for the secret's metadata. First, to fetch it for the rollback function:
+
+```go
+	secretMeta, err := s.secrets.Get(ctx, username, key)
+	if err != nil {
+		return tx.Rollback(fmt.Errorf("failed to fetch secret: %v", err))
+	}
+	tx.Add(func() error {
+		_, err := s.secrets.Create(ctx, username, secretMeta)
+		return err
+	})
+```
+
+7. Then, to finally delete it:
+
+```go
+	err = s.secrets.Delete(ctx, username, key)
+	if err != nil {
+		return tx.Rollback(fmt.Errorf("failed to remove secret: %v", err))
+	}
+```
+
+Here is the whole method:
 
 ```go
 // DeleteSecret removes a secret with key `key` from the user `username`. Returns an error
