@@ -5390,6 +5390,37 @@ To map the endpoints I first take a look at the Service interface and try to ske
 
 ![HTTP Schema](./media/Secr_HTTP_Endpoints.jpg)
 
+Now, for the HTTP implementation. I've created a new top-level folder called `transport` with a `http` subfolder. Transport can refer to different implementations of the transport layer, and this will be for a HTTP server.
+
+```
+.
+└─ transport
+    └─ http
+        ├─ helper.go -- helper functions that are recurrent in HTTP
+        ├─ middleware.go -- HTTP middleware, like auth
+        ├─ routes.go -- endpoints and mux routing
+        ├─ secrets.go -- secrets handler funcs
+        ├─ server.go -- HTTP server data structure and interface
+        ├─ session.go -- sessions handler funcs
+        ├─ shared.go -- shares handler funcs
+        └─ users.go -- users handler funcs
+```
+
+
+#### Defining the server
+
+In `transport/http/server.go` I declare a data structure with a `*ghttp.Server` and the Service interface:
+
+```go
+type server struct {
+	s    service.Service
+	HTTP *ghttp.Server
+}
+```
+
+From this point I can start desiging the actual handler funcs before even worrying about the endpoints structure.
+
+
 #### Handling endpoints that require auth
 ___________
 
