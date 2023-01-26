@@ -4283,7 +4283,69 @@ func (s service) DeleteSecret(ctx context.Context, username string, key string) 
 
 #### Implementing Service Shares methods
 
-Let's *share* a blank canvas for this one:
+For the shared secrets, the only new element (that needs to be validated) is the input time / duration for the share's expiry.
+
+To validate this type of input, a `validate.go` file is added to the `shared` package folder:
+
+```
+.
+└─ shared
+    ├─ repository.go
+    ├─ shared.go 
+    └─ validate.go -- shares-related validator functions
+```
+
+This file will contain two functions:
+
+`ValidateDuration` ensures that the input duration is not zero:
+
+```go
+import (
+	"errors"
+	"time"
+)
+
+var ErrEmptyDuration = errors.New("duration cannot be zero")
+
+// ValidateDuration verifies if the input duration is valid, returning an error
+// if otherwise
+func ValidateDuration(dur time.Duration) error {
+	if dur == 0 {
+		return ErrEmptyDuration
+	}
+	return nil
+}
+```
+
+`ValidateTime` ensures that the input time is not zero and is not expired (pointing to a past date):
+
+```go
+import (
+	"errors"
+	"time"
+)
+
+var zeroTime = time.Time{}
+
+var (
+	ErrEmptyTime     = errors.New("time cannot be zero")
+	ErrExpired       = errors.New("input time is already expired")
+)
+
+// ValidateTime verifies if the input time is valid, returning an error
+// if otherwise
+func ValidateTime(t time.Time) error {
+	if t.IsZero() || t == zeroTime {
+		return ErrEmptyTime
+	}
+	if time.Now().After(t) {
+		return ErrExpired
+	}
+	return nil
+}
+```
+
+Having these validator functions defined, it's time to *share* a blank canvas for the service implementation:
 
 ```go
 package service
@@ -4331,6 +4393,398 @@ func (s service) DeleteShare(ctx context.Context, owner, secretKey string, targe
 // PurgeShares removes the shared secret completely, so it's no longer available to the users it was
 // shared with. Returns an error
 func (s service) PurgeShares(ctx context.Context, owner, secretKey string) error {
+	return nil
+}
+```
+
+
+
+**`service.CreateShare` / `ShareFor` / `ShareUntil` **
+
+The shares create actions allow 3 different approaches:
+- one where the user does not define an expiry (which is imposed by the service)
+- the user defines a date when the share should expire
+- the user defines a duration for it to exist
+
+All in all, these are very similar approaches, with a single difference (apart from the signature). This section covers `service.CreateShare`, and at the end positions how `ShareFor` and `ShareUntil` differ from it.
+
+1. Validate the user's input for the owner, secret key and length of targets. The targets usernames will be validated afterwards:
+
+```go
+	if err := user.ValidateUsername(owner); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidUser, err)
+	}
+	if isShared, err := secret.ValidateKey(secretKey); err != nil || isShared {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidKey, err)
+	}
+	if len(targets) == 0 {
+		return nil, ErrZeroTargets
+	}
+```
+
+2. Initialize a `*shared.Share` object with the secret key, owner and `Until` field -- in this case defined with the default share duration (of 1 month)
+
+> Note: this is the step that will differ in `ShareFor` and `ShareUntil`, as the `*shared.Share`'s Until field is configured differently
+
+```go
+	sh := &shared.Share{
+		SecretKey: secretKey,
+		Owner:     owner,
+		Until:     ptr.To(time.Now().Add(shared.DefaultShareDuration)),
+	}
+```
+
+3. Iterate through all input targets, validating their username and appending them to the list of targets, if valid
+
+```go
+	for _, t := range targets {
+		if err := user.ValidateUsername(t); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrInvalidUser, err)
+		}
+		sh.Target = append(sh.Target, t)
+	}
+```
+
+4. The database will constrain the shares with unique values between the secret and the target user. As such, clear any existing shares of this secret with these target users, first:
+
+```go
+	err := s.shares.Delete(ctx, sh)
+	if err != nil && !errors.Is(sqlite.ErrNotFoundShare, err) {
+		return nil, fmt.Errorf("failed to remove previous shared secrets: %v", err)
+	}
+```
+
+5. Finally, create the share and return the object with the new ID
+
+```go
+	id, err := s.shares.Create(ctx, sh)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create shared secret: %v", err)
+	}
+
+	sh.ID = id
+	return sh, nil
+```
+
+Here is the complete method:
+
+```go
+// CreateShare shares the secret with key `secretKey` belonging to user with username `owner`, with users `targets`.
+// Returns the resulting shared secret, and an error
+func (s service) CreateShare(ctx context.Context, owner, secretKey string, targets ...string) (*shared.Share, error) {
+	if err := user.ValidateUsername(owner); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidUser, err)
+	}
+	if isShared, err := secret.ValidateKey(secretKey); err != nil || isShared {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidKey, err)
+	}
+	if len(targets) == 0 {
+		return nil, ErrZeroTargets
+	}
+
+	sh := &shared.Share{
+		SecretKey: secretKey,
+		Owner:     owner,
+		Until:     ptr.To(time.Now().Add(shared.DefaultShareDuration)),
+	}
+	for _, t := range targets {
+		if err := user.ValidateUsername(t); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrInvalidUser, err)
+		}
+		sh.Target = append(sh.Target, t)
+	}
+	err := s.shares.Delete(ctx, sh)
+	if err != nil && !errors.Is(sqlite.ErrNotFoundShare, err) {
+		return nil, fmt.Errorf("failed to remove previous shared secrets: %v", err)
+	}
+
+	id, err := s.shares.Create(ctx, sh)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create shared secret: %v", err)
+	}
+
+	sh.ID = id
+	return sh, nil
+}
+```
+
+The `ShareFor` method will have a different steps 1. and 2., for validation and applying the input duration:
+
+1. Validate the user's input for the owner, secret key, length of targets and duration. The targets usernames will be validated afterwards:
+
+```go
+	if err := user.ValidateUsername(owner); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidUser, err)
+	}
+	if isShared, err := secret.ValidateKey(secretKey); err != nil || isShared {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidKey, err)
+	}
+	if len(targets) == 0 {
+		return nil, ErrZeroTargets
+	}
+	if err := shared.ValidateDuration(dur); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidTime, err)
+	}
+```
+
+2. Initialize a `*shared.Share` object with the secret key, owner and `Until` field -- in this case defined with the current time plus the input duration
+
+> Note: this is the step that will differ in `CreateShare` and `ShareUntil`, as the `*shared.Share`'s Until field is configured differently
+
+```go
+	sh := &shared.Share{
+		SecretKey: secretKey,
+		Owner:     owner,
+		Until:     ptr.To(time.Now().Add(dur)),
+	}
+```
+
+The `ShareUntil` method will also have slightly different steps 1. and 2., for validation and applying the input time:
+
+
+1. Validate the user's input for the owner, secret key, length of targets and time. The targets usernames will be validated afterwards:
+
+```go
+	if err := user.ValidateUsername(owner); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidUser, err)
+	}
+	if isShared, err := secret.ValidateKey(secretKey); err != nil || isShared {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidKey, err)
+	}
+	if len(targets) == 0 {
+		return nil, ErrZeroTargets
+	}
+	if err := shared.ValidateTime(until); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidTime, err)
+	}
+```
+
+2. Initialize a `*shared.Share` object with the secret key, owner and `Until` field -- in this case defined with a pointer to the input time:
+
+> Note: this is the step that will differ in `CreateShare` and `ShareFor`, as the `*shared.Share`'s Until field is configured differently
+
+```go
+	sh := &shared.Share{
+		SecretKey: secretKey,
+		Owner:     owner,
+		Until:     &until,
+	}
+```
+
+
+**`service.GetShare`**
+
+Fetching a shared secret is simple as most of the heavy-lifting is done in SQL
+
+1. Validation, validation, validation. This method will not be used to fetch a secret shared with the caller; but the owner's shares (thus rejecting a call for a shared secret's key)
+
+```go
+	if err := user.ValidateUsername(username); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidUser, err)
+	}
+	if isShared, err := secret.ValidateKey(secretKey); err != nil || isShared {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidKey, err)
+	}
+```
+
+2. Then, just fetch the shares from the shared.Repository
+
+```go
+	sh, err := s.shares.Get(ctx, username, secretKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch shared secret: %v", err)
+	}
+	return sh, nil
+```
+
+The entire method:
+
+```go
+// GetShare fetches the shared secret belonging to `username`, with key `secretKey`, returning it as a
+// shared secret and an error
+func (s service) GetShare(ctx context.Context, username, secretKey string) ([]*shared.Share, error) {
+	if err := user.ValidateUsername(username); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidUser, err)
+	}
+	if isShared, err := secret.ValidateKey(secretKey); err != nil || isShared {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidKey, err)
+	}
+
+	sh, err := s.shares.Get(ctx, username, secretKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch shared secret: %v", err)
+	}
+	return sh, nil
+}
+```
+
+**`service.ListShares`**
+
+Just like the above, but without a key validation, and with a call to `shared.Repository.List`:
+
+```go
+// ListShares fetches all the secrets the user with username `username` has shared with other users
+func (s service) ListShares(ctx context.Context, username string) ([]*shared.Share, error) {
+	if err := user.ValidateUsername(username); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidUser, err)
+	}
+
+	sh, err := s.shares.List(ctx, username)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list shared secrets: %v", err)
+	}
+	return sh, nil
+}
+```
+
+**`service.DeleteShare`**
+
+The approach to this call is similar to the one in `CreateShare` (with the opposite purpose). That will be:
+
+1. Validating the input owner's username, secret key and length of the list of targets. If no targets are provided, the call will be handled as a `service.PurgeShares` call:
+
+```go
+	if err := user.ValidateUsername(owner); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidUser, err)
+	}
+	if isShared, err := secret.ValidateKey(secretKey); err != nil || isShared {
+		return fmt.Errorf("%w: %v", ErrInvalidKey, err)
+	}
+	if len(targets) == 0 {
+		return s.PurgeShares(ctx, owner, secretKey)
+	}
+```
+
+2. Create a `*shared.Share` object with the owner and secret key, then iterate through all targets validating their username, then appending them to the targets list if valid:
+
+```go
+	sh := &shared.Share{
+		SecretKey: secretKey,
+		Owner:     owner,
+	}
+	for _, t := range targets {
+		if err := user.ValidateUsername(t); err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalidUser, err)
+		}
+		sh.Target = append(sh.Target, t)
+	}
+```
+
+3. Finally, remove the shared secret:
+
+```go
+	err := s.shares.Delete(ctx, sh)
+	if err != nil && !errors.Is(sqlite.ErrNotFoundShare, err) {
+		return fmt.Errorf("failed to delete shared secret: %v", err)
+	}
+```
+
+Here is the entire method:
+
+
+```go
+// DeleteShare removes the users `targets` from a shared secret with key `secretKey`, belonging to `username`. Returns
+// an error
+func (s service) DeleteShare(ctx context.Context, owner, secretKey string, targets ...string) error {
+	if err := user.ValidateUsername(owner); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidUser, err)
+	}
+	if isShared, err := secret.ValidateKey(secretKey); err != nil || isShared {
+		return fmt.Errorf("%w: %v", ErrInvalidKey, err)
+	}
+	if len(targets) == 0 {
+		return s.PurgeShares(ctx, owner, secretKey)
+	}
+
+	sh := &shared.Share{
+		SecretKey: secretKey,
+		Owner:     owner,
+	}
+	for _, t := range targets {
+		if err := user.ValidateUsername(t); err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalidUser, err)
+		}
+		sh.Target = append(sh.Target, t)
+	}
+
+	err := s.shares.Delete(ctx, sh)
+	if err != nil && !errors.Is(sqlite.ErrNotFoundShare, err) {
+		return fmt.Errorf("failed to delete shared secret: %v", err)
+	}
+	return nil
+}
+```
+
+**`service.PurgeShares`**
+
+`PurgeShares` will clear all shares for a secret. To do so, I need to fetch the shares for the input owner and secret key combination, and remove them.
+
+1. First thing's first, validation:
+
+```go
+	if err := user.ValidateUsername(owner); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidUser, err)
+	}
+	if isShared, err := secret.ValidateKey(secretKey); err != nil || isShared {
+		return fmt.Errorf("%w: %v", ErrInvalidKey, err)
+	}
+```
+
+2. Then, fetching the secrets for this owner and key:
+
+```go
+	sh, err := s.shares.Get(ctx, owner, secretKey)
+	if err != nil {
+		return fmt.Errorf("failed to fetch shared secret: %v", err)
+	}
+```
+
+3. Finally, within a transaction, remove all shares for this secret
+
+```go
+	tx := newTx()
+	for _, share := range sh {
+		tx.Add(func() error {
+			_, err := s.shares.Create(ctx, share)
+			return err
+		})
+		err := s.shares.Delete(ctx, share)
+		if err != nil {
+			return tx.Rollback(fmt.Errorf("failed to remove shared secret: %v", err))
+		}
+	}
+```
+
+Here is the whole method:
+
+```go
+// PurgeShares removes the shared secret completely, so it's no longer available to the users it was
+// shared with. Returns an error
+func (s service) PurgeShares(ctx context.Context, owner, secretKey string) error {
+	if err := user.ValidateUsername(owner); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidUser, err)
+	}
+	if isShared, err := secret.ValidateKey(secretKey); err != nil || isShared {
+		return fmt.Errorf("%w: %v", ErrInvalidKey, err)
+	}
+
+	sh, err := s.shares.Get(ctx, owner, secretKey)
+	if err != nil {
+		return fmt.Errorf("failed to fetch shared secret: %v", err)
+	}
+
+	tx := newTx()
+
+	for _, share := range sh {
+		tx.Add(func() error {
+			_, err := s.shares.Create(ctx, share)
+			return err
+		})
+		err := s.shares.Delete(ctx, share)
+		if err != nil {
+			return tx.Rollback(fmt.Errorf("failed to remove shared secret: %v", err))
+		}
+	}
 	return nil
 }
 ```
