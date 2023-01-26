@@ -3421,8 +3421,176 @@ func (s service) DeleteSecret(ctx context.Context, username string, key string) 
 
 **`service.CreateSecret`**
 
-This action stores (or overwrites) a secret
+This action stores (or overwrites) a secret when called, but there are also the shares to consider. This database schema imposes a link between the **secret ID** and users it is shared with.
 
+This means that overwriting an existing secret with `CreateSecret` must go through fetching and deleting both the existing secret and its shares. The `Transactioner` comes in handy for these types of operations.
+
+After going through the existing secret's ordeal, the new secret can finally be created.
+
+For this, I need to fetch the user's (private) cipher key to encrypt the input value, and store that ciphertext in the keys.Repository, under the user's bucket.
+
+Then, the secret's metadata can be stored in the secret.Repository.
+
+Here is a recap of these actions and code to follow along:
+
+1. Validating the input (username, secret key and secret value); note that the call is rejected when the user attempts to *crate* a secret whose key implies a share. 
+
+```go
+	if err := user.ValidateUsername(username); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidUser, err)
+	}
+	if isShared, err := secret.ValidateKey(key); err != nil || isShared {
+		return fmt.Errorf("%w: %v", ErrInvalidKey, err)
+	}
+	if err := secret.ValidateValue(value); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidValue, err)
+	}
+```
+
+2. Fetching the user from their username
+
+```go
+	u, err := s.users.Get(ctx, username)
+	if err != nil {
+		return fmt.Errorf("failed to fetch user: %v", err)
+	}
+```
+
+3. Checking if the secret already exists (to overwrite it). Begin a transaction to be able to rollback any deletions
+
+```go
+	tx := newTx()
+
+	oldSecr, err := s.secrets.Get(ctx, username, key)
+	if err != nil && !errors.Is(sqlite.ErrNotFoundSecret, err) {
+		return fmt.Errorf("failed to fetch previous secret under this key: %v", err)
+	}
+```
+
+4. Overwrite routine: if the secret exists, then first thing's first, fetching any shares for this secret:
+
+```go
+	if oldSecr != nil {
+		shares, err := s.shares.Get(ctx, username, oldSecr.Key)
+		if err != nil && !errors.Is(sqlite.ErrNotFoundShare, err) {
+			return fmt.Errorf("failed to fetch previous shared secrets: %v", err)
+		}
+	// (...)
+	}
+```
+
+5. Iterating through each share to remove it. Pushing a new rollback function into the transaction as well
+
+```go
+	if oldSecr != nil {
+	// (...)
+		for _, sh := range shares {
+			tx.Add(func() error {
+				_, err := s.shares.Create(ctx, sh)
+				return err
+			})
+			err := s.shares.Delete(ctx, sh)
+			if err != nil {
+				return tx.Rollback(fmt.Errorf("failed to remove old share: %v", err))
+			}
+		}
+	// (...)
+	}
+```
+
+6. Now the actual secret. Fetching the secret's value (still encrypted) for the rollback function
+
+```go
+	if oldSecr != nil {
+	// (...)
+		val, err := s.keys.Get(ctx, keys.UserBucket(u.ID), key)
+		if err != nil {
+			return tx.Rollback(fmt.Errorf("failed to fetch old secret's value: %v", err))
+		}
+		tx.Add(func() error {
+			return s.keys.Set(ctx, keys.UserBucket(u.ID), key, val)
+		})
+	// (...)
+	}
+```
+
+7. Removing the old secret's value from the keys.Repository
+
+
+```go
+	if oldSecr != nil {
+	// (...)
+		err = s.keys.Delete(ctx, keys.UserBucket(u.ID), key)
+		if err != nil {
+			return tx.Rollback(fmt.Errorf("failed to remove old secret's value: %v", err))
+		}
+	// (...)
+	}
+```
+
+8. Remove the old secret's metadata from the secrets.Repository
+
+```go
+	if oldSecr != nil {
+	// (...)
+		tx.Add(func() error {
+			_, err := s.secrets.Create(ctx, username, oldSecr)
+			return err
+		})
+		err = s.secrets.Delete(ctx, username, key)
+		if err != nil {
+			return tx.Rollback(fmt.Errorf("failed to remove old secret: %v", err))
+		}
+	}
+```
+
+9. Cool, back to adding the **new** secret. First, getting the user's private key
+
+```go
+	cipherKey, err := s.keys.Get(ctx, keys.UserBucket(u.ID), keys.UniqueID)
+	if err != nil {
+		return tx.Rollback(fmt.Errorf("failed to get user's private key: %v", err))
+	}
+```
+
+10. Encrypting the value with the user's private key
+
+```go
+	cipher := crypt.NewCipher(cipherKey)
+	encValue, err := cipher.Encrypt(value)
+	if err != nil {
+		return tx.Rollback(fmt.Errorf("failed to encrypt value: %v", err))
+	}
+```
+
+11. Storing the encrypted secret value in the keys.Repository; note that the rollback function will only remove the secret if there wasn't one before (it doesn't apply to overwrites)
+
+```go
+	err = s.keys.Set(ctx, keys.UserBucket(u.ID), key, encValue)
+	if err != nil {
+		return tx.Rollback(fmt.Errorf("failed to store the secret: %v", err))
+	}
+	tx.Add(func() error {
+		if oldSecr == nil {
+			return s.keys.Delete(ctx, keys.UserBucket(u.ID), key)
+		}
+		return nil
+	})
+```
+
+12. Finally, adding the secret's metadata to the secret.Repository
+
+```go
+	secr := &secret.Secret{
+		Key: key,
+	}
+	id, err := s.secrets.Create(ctx, username, secr)
+	if err != nil {
+		return tx.Rollback(fmt.Errorf("failed to create the secret: %v", err))
+	}
+```
+
+Here is how the whole thing looks:
 
 ```go
 // CreateSecret creates a secret with key `key` and value `value` (as a slice of bytes), for the
@@ -3472,7 +3640,6 @@ func (s service) CreateSecret(ctx context.Context, username string, key string, 
 		if err != nil {
 			return tx.Rollback(fmt.Errorf("failed to fetch old secret's value: %v", err))
 		}
-
 		tx.Add(func() error {
 			return s.keys.Set(ctx, keys.UserBucket(u.ID), key, val)
 		})
@@ -3487,7 +3654,6 @@ func (s service) CreateSecret(ctx context.Context, username string, key string, 
 			_, err := s.secrets.Create(ctx, username, oldSecr)
 			return err
 		})
-
 		// remove the secret's metadata
 		err = s.secrets.Delete(ctx, username, key)
 		if err != nil {
@@ -3538,6 +3704,17 @@ func (s service) CreateSecret(ctx context.Context, username string, key string, 
 
 **`service.GetSecret`**
 
+Fetching a secret has simply one thing to consider; whether the target secret is shared or not. If it is shared, the key is expected to be in a `username:key` format, which will allow the secret key to be validated accordingly. Afterall, this will be how shared secrets appear to users.
+
+To allow some actions to be reusable in separate methods, I added `getSecret` and `getSharedSecret`.
+
+The `GetSecret` method will simply validate the user's input and depending on the `isShared` boolean from validating the secret key, either route is taken: `getSecret` or `getSharedSecret`
+
+`getSecret` fetches the user's private key and the secret value, deciphers it and returns a `*secret.Secret` already with its metadata.
+
+`getSharedSecret` validates the request by fetching the owner's shares for this secret, and checking whether the share is not expired, and if the user is a target. If they are, then the secret is deciphered with a `getSecret` call, and its key updated to the `username:key` format.
+
+
 ```go
 // GetSecret fetches the secret with key `key`, for user `username`. Returns a secret and an error
 func (s service) GetSecret(ctx context.Context, username string, key string) (*secret.Secret, error) {
@@ -3558,7 +3735,7 @@ func (s service) GetSecret(ctx context.Context, username string, key string) (*s
 	return s.getSecret(ctx, username, key)
 }
 
-func (s service) getSecret(ctx context.Context, username, key string) (*secret.Secret, error) {
+func (s service) getSecret(ctx conandtext.Context, username, key string) (*secret.Secret, error) {
 	u, err := s.users.Get(ctx, username)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch user: %v", err)
