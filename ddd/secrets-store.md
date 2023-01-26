@@ -2410,10 +2410,6 @@ type Service interface {
 	ChangePassword(ctx context.Context, username, password, newPassword string) error
 	// Refresh renews a user's JWT provided it is a valid one. Returns a session and an error
 	Refresh(ctx context.Context, username, token string) (*user.Session, error)
-	// Validate verifies if a user's JWT is a valid one, returning a boolean and an error
-	Validate(ctx context.Context, username, token string) (bool, error)
-	// ParseToken reads the input token string and returns the corresponding user in it, or an error
-	ParseToken(ctx context.Context, token string) (*user.User, error)
 
 	// CreateUser creates the user under username `username`, with the provided password `password` and name `name`
 	// It returns a user and an error
@@ -4821,17 +4817,446 @@ func (s service) ChangePassword(ctx context.Context, username, password, newPass
 func (s service) Refresh(ctx context.Context, username, token string) (*user.Session, error) {
 	return nil, nil
 }
+```
 
-// Validate verifies if a user's JWT is a valid one, returning a boolean and an error
-func (s service) Validate(ctx context.Context, username, token string) (bool, error) {
-	return false, nil
-}
+These methods will handle authentication and authorization-related requests.
 
-func (s service) ParseToken(ctx context.Context, token string) (*user.User, error) {
-	return nil, nil
+Starting with `Login`; the action needs to validate the input username and password; fetch the user from the user.Repository, and match their password to the stored hash.
+
+From here, it's a matter of creating a new JWT for the user, storing it in the keys.Repository and returning a `*user.Session`.
+
+To handle the credentials verification, I will add a separate `login` method that can be used on other session-related service methods. Let's start with that one, here is the signature:
+
+```go
+(s service) login(ctx context.Context, u *user.User, password string) error
+```
+
+1. For this procedure, starting by base64-decoding the hash and salt values
+
+```go
+	hash, err := base64.StdEncoding.DecodeString(u.Hash)
+	if err != nil {
+		return fmt.Errorf("failed to decode hash: %v", err)
+	}
+	salt, err := base64.StdEncoding.DecodeString(u.Salt)
+	if err != nil {
+		return fmt.Errorf("failed to decode salt: %v", err)
+	}
+```
+
+2. Hash the input password with the salt appended to it
+
+```go
+	hashedPassword := sha256.Sum256(append([]byte(password), salt...))
+```
+
+3. Compare this value with the stored hash. If it doesn't match it is an incorrect password
+
+```go
+	if string(hashedPassword[:]) != string(hash) {
+		return ErrIncorrectPassword
+	}
+	return nil
+```
+
+The entire function:
+
+```go
+func (s service) login(ctx context.Context, u *user.User, password string) error {
+	hash, err := base64.StdEncoding.DecodeString(u.Hash)
+	if err != nil {
+		return fmt.Errorf("failed to decode hash: %v", err)
+	}
+	salt, err := base64.StdEncoding.DecodeString(u.Salt)
+	if err != nil {
+		return fmt.Errorf("failed to decode salt: %v", err)
+	}
+	hashedPassword := sha256.Sum256(append([]byte(password), salt...))
+
+	if string(hashedPassword[:]) != string(hash) {
+		return ErrIncorrectPassword
+	}
+	return nil
 }
 ```
 
+Now, for `service.Login`:
+
+1. Validate the input username and password:
+
+```go
+	if err := user.ValidateUsername(username); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidUser, err)
+	}
+	if err := user.ValidatePassword(password); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidPassword, err)
+	}
+```
+
+2. Fetch the user by their username
+
+```go
+	u, err := s.users.Get(ctx, username)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch user %s: %v", username, err)
+	}
+```
+
+3. Validate the user credentials with the `login` method
+
+```go
+	if err := s.login(ctx, u, password); err != nil {
+		return nil, fmt.Errorf("failed to validate user credentials: %v", err)
+	}
+```
+
+4. If there isn't an error, everything checks out. Time to issue a new token:
+
+```go
+	token, err := s.auth.NewToken(ctx, u)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create a new session token: %v", err)
+	}
+```
+
+5. Then, to store it in the `keys.Repository`, in the user's bucket, under the `keys.TokenKey` reserved identifier
+
+```go
+	err = s.keys.Set(ctx, keys.UserBucket(u.ID), keys.TokenKey, []byte(token))
+	if err != nil {
+		return nil, fmt.Errorf("failed to store the new session token: %v", err)
+	}
+
+	return &user.Session{
+		User:  *u,
+		Token: token,
+	}, nil
+```
+
+Here's the entire method:
+
+```go
+// Login verifies the user's credentials and returns a session and an error
+func (s service) Login(ctx context.Context, username, password string) (*user.Session, error) {
+	if err := user.ValidateUsername(username); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidUser, err)
+	}
+	if err := user.ValidatePassword(password); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidPassword, err)
+	}
+
+	// fetch user
+	u, err := s.users.Get(ctx, username)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch user %s: %v", username, err)
+	}
+
+	// validate credentials
+	if err := s.login(ctx, u, password); err != nil {
+		return nil, fmt.Errorf("failed to validate user credentials: %v", err)
+	}
+
+	// issue token
+	token, err := s.auth.NewToken(ctx, u)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create a new session token: %v", err)
+	}
+
+	err = s.keys.Set(ctx, keys.UserBucket(u.ID), keys.TokenKey, []byte(token))
+	if err != nil {
+		return nil, fmt.Errorf("failed to store the new session token: %v", err)
+	}
+
+	return &user.Session{
+		User:  *u,
+		Token: token,
+	}, nil
+}
+```
+
+
+**`service.Logout`**
+
+Logout just involves validating the caller's user, and deleting the JWT from the `keys.Repository`:
+
+1. Validate the input username
+
+
+```go
+	if err := user.ValidateUsername(username); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidUser, err)
+	}
+```
+
+2. Fetch the user
+
+```go
+	u, err := s.users.Get(ctx, username)
+	if err != nil {
+		return fmt.Errorf("failed to fetch user: %v", err)
+	}
+```
+
+3. Delete the stored JWT from the `keys.Repository`
+
+```go
+	err = s.keys.Delete(ctx, keys.UserBucket(u.ID), keys.TokenKey)
+	if err != nil {
+		return fmt.Errorf("failed to log user out: %v", err)
+	}
+	return nil
+```
+
+Here's the whole `Logout` method:
+
+```go
+// Logout signs-out the user `username`
+func (s service) Logout(ctx context.Context, username string) error {
+	if err := user.ValidateUsername(username); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidUser, err)
+	}
+
+	u, err := s.users.Get(ctx, username)
+	if err != nil {
+		return fmt.Errorf("failed to fetch user: %v", err)
+	}
+
+	err = s.keys.Delete(ctx, keys.UserBucket(u.ID), keys.TokenKey)
+	if err != nil {
+		return fmt.Errorf("failed to log user out: %v", err)
+	}
+	return nil
+}
+```
+
+**`service.ChangePassword`**
+
+This method updates a user's password. For this, I need to ensure the current credentials are valid, and then update the `user.Repository` with the new password hash.
+
+1. Validate the user input (username, old password and new password)
+
+```go
+	if err := user.ValidateUsername(username); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidUser, err)
+	}
+	if err := user.ValidatePassword(password); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidPassword, err)
+	}
+	if err := user.ValidatePassword(newPassword); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidPassword, err)
+	}
+```
+
+2. Fetch the user by their username
+
+```go
+	u, err := s.users.Get(ctx, username)
+	if err != nil {
+		return fmt.Errorf("failed to fetch user %s: %v", username, err)
+	}
+```
+
+3. Validate the current password with the `login` method
+
+```go
+	if err := s.login(ctx, u, password); err != nil {
+		return fmt.Errorf("failed to validate user credentials: %v", err)
+	}
+```
+
+4. Base64-decode the salt value
+
+```go
+	salt, err := base64.StdEncoding.DecodeString(u.Salt)
+	if err != nil {
+		return fmt.Errorf("failed to decode salt: %v", err)
+	}
+```
+
+
+5. Generate a hash of the new password with the user's salt appended to it 
+
+```go
+	hashedPassword := sha256.Sum256(append([]byte(newPassword), salt...))
+	u.Hash = string(hashedPassword[:])
+```
+
+6. Update the user with the new hash value
+
+```go
+	err = s.users.Update(ctx, username, u)
+	if err != nil {
+		return fmt.Errorf("failed to update user %s's password: %v", username, err)
+	}
+	return nil
+```
+
+Behold, the entire method:
+
+```go
+// ChangePassword updates user `username`'s password after verifying the old one, returning an error
+func (s service) ChangePassword(ctx context.Context, username, password, newPassword string) error {
+	if err := user.ValidateUsername(username); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidUser, err)
+	}
+	if err := user.ValidatePassword(password); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidPassword, err)
+	}
+	if err := user.ValidatePassword(newPassword); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidPassword, err)
+	}
+
+	// fetch user
+	u, err := s.users.Get(ctx, username)
+	if err != nil {
+		return fmt.Errorf("failed to fetch user %s: %v", username, err)
+	}
+
+	if err := s.login(ctx, u, password); err != nil {
+		return fmt.Errorf("failed to validate user credentials: %v", err)
+	}
+
+	salt, err := base64.StdEncoding.DecodeString(u.Salt)
+	if err != nil {
+		return fmt.Errorf("failed to decode salt: %v", err)
+	}
+
+	hashedPassword := sha256.Sum256(append([]byte(newPassword), salt...))
+	u.Hash = string(hashedPassword[:])
+
+	err = s.users.Update(ctx, username, u)
+	if err != nil {
+		return fmt.Errorf("failed to update user %s's password: %v", username, err)
+	}
+	return nil
+}
+```
+
+
+**`service.Refresh`**
+
+This method allows extending a user's session in exchange for a currently valid token. Since the tokens have expiry of one hour, a user can call this method to get a new token, valid for another hour.
+
+So, in a nutshell:
+- ensure token is valid
+- create a new token for the same user
+- store it in the `keys.Repository`
+- return the new token to the user
+
+Here's how it's implemented:
+
+1. Validate the input username and token (ensuring the token is not an empty string; its validation will come on step 3.)
+
+```go
+	if err := user.ValidateUsername(username); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidUser, err)
+	}
+	if token == "" {
+		return nil, fmt.Errorf("%w: token cannot be empty", ErrInvalidPassword)
+	}
+```
+
+2. Fetch the user
+
+```go
+	u, err := s.users.Get(ctx, username)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch user %s: %v", username, err)
+	}
+```
+
+3. Parse the input token to ensure it is valid
+
+```go
+	jwtUser, err := s.auth.Parse(ctx, token)
+	if err != nil {
+		return nil, fmt.Errorf("failed to validate token: %v", err)
+	}
+```
+
+4. Ensure that the token belongs to the caller
+
+```go
+	if jwtUser.Username != u.Username {
+		return nil, ErrIncorrectPassword
+	}
+```
+
+5. Generate a new JWT
+
+```go
+	newToken, err := s.auth.NewToken(ctx, u)
+	if err != nil {
+		return nil, fmt.Errorf("failed to refresh token: %v", err)
+	}
+```
+
+6. Store it in the `keys.Repository`
+
+```go
+	err = s.keys.Set(ctx, keys.UserBucket(u.ID), keys.TokenKey, []byte(newToken))
+	if err != nil {
+		return nil, fmt.Errorf("failed to store the new session token: %v", err)
+	}
+```
+
+7. Return the token to the caller
+
+```go
+	return &user.Session{
+		User:  *u,
+		Token: newToken,
+	}, nil
+```
+
+Here's the entire `Refresh` method:
+
+
+```go
+// Refresh renews a user's JWT provided it is a valid one. Returns a session and an error
+func (s service) Refresh(ctx context.Context, username, token string) (*user.Session, error) {
+	if err := user.ValidateUsername(username); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidUser, err)
+	}
+	if token == "" {
+		return nil, fmt.Errorf("%w: token cannot be empty", ErrInvalidPassword)
+	}
+
+	// fetch user
+	u, err := s.users.Get(ctx, username)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch user %s: %v", username, err)
+	}
+
+	jwtUser, err := s.auth.Parse(ctx, token)
+	if err != nil {
+		return nil, fmt.Errorf("failed to validate token: %v", err)
+	}
+
+	if jwtUser.Username != u.Username {
+		return nil, ErrIncorrectPassword
+	}
+
+	newToken, err := s.auth.NewToken(ctx, u)
+	if err != nil {
+		return nil, fmt.Errorf("failed to refresh token: %v", err)
+	}
+
+	err = s.keys.Set(ctx, keys.UserBucket(u.ID), keys.TokenKey, []byte(newToken))
+	if err != nil {
+		return nil, fmt.Errorf("failed to store the new session token: %v", err)
+	}
+
+	return &user.Session{
+		User:  *u,
+		Token: newToken,
+	}, nil
+}
+```
+
+Fantastic! The Service interface is implemented. Technically the app already works as a library, right now so cheers to that!
+
+Next step is to move over to the transport layer, as a HTTP API with JSON documents. Simple and straight-forward.
 ___________
 
 ### HTTP API implementation 
