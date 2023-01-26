@@ -5374,7 +5374,7 @@ func Do[Q any, A any](name string, parseFn ParseFn[Q], queryFn ExecFn[Q, A]) htt
 
 - `ParseFn` will read the HTTP request to build a query object (of the caller's choice). If you're creating a user, you can create a handler func that implements the (private) `usersCreateRequest` type, and your ParseFn returns this type after reading the request.
 
-- `ExecFn` will perform the call to the system, to satisfy the caller's request. It's mandatory to have one, even if no-op. The `ExecFn` accepts a query of the same type as the `ParseFn`'s return, and regardless if it's user or not, it will be initialized for the `ExecFn` call.
+- `ExecFn` will perform the call to the system, to satisfy the caller's request. It's mandatory to have one, even if no-op. The `ExecFn` accepts a query of the same type as the `ParseFn`'s return, and regardless if it's user or not, it will be initialized for the `ExecFn` call. The type parameters it accepts is `A` for the type returned by `ParseFn` and `Q` the desired data response type to include in the response
 
 - `MiddlewareFn` is a simple type to describe HTTP middleware
 
@@ -5382,7 +5382,13 @@ func Do[Q any, A any](name string, parseFn ParseFn[Q], queryFn ExecFn[Q, A]) htt
 
 These types are the main reason why I wrote the `ghttp` library. I personally feel it takes a lot of boilerplate away when using the standard library for HTTP APIs. The other features are used and *nice to have* but not nearly as important as these.
 
+The other `ghttp` features used on this app will be covered on-the-go
+
 #### Designing the endpoints
+
+To map the endpoints I first take a look at the Service interface and try to sketch out what seems the most reasonable (how should paths cascade, the HTTP verbs used, the superficial stuff). Here is the sketch for the paths, mapped to other paths or HTTP verbs, pointing to service methods:
+
+[HTTP Schema](./media/Secr_HTTP_Endpoints.jpg)
 
 #### Handling endpoints that require auth
 ___________
