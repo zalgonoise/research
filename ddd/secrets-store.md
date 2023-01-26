@@ -2410,6 +2410,8 @@ type Service interface {
 	ChangePassword(ctx context.Context, username, password, newPassword string) error
 	// Refresh renews a user's JWT provided it is a valid one. Returns a session and an error
 	Refresh(ctx context.Context, username, token string) (*user.Session, error)
+	// ParseToken reads the input token string and returns the corresponding user in it, or an error
+	ParseToken(ctx context.Context, token string) (*user.User, error)
 
 	// CreateUser creates the user under username `username`, with the provided password `password` and name `name`
 	// It returns a user and an error
@@ -4817,9 +4819,17 @@ func (s service) ChangePassword(ctx context.Context, username, password, newPass
 func (s service) Refresh(ctx context.Context, username, token string) (*user.Session, error) {
 	return nil, nil
 }
+
+// ParseToken reads the input token string and returns the corresponding user in it, or an error
+func (s service) ParseToken(ctx context.Context, token string) (*user.User, error) {
+	return nil, nil
+}
 ```
 
 These methods will handle authentication and authorization-related requests.
+
+
+**`service.Login`**
 
 Starting with `Login`; the action needs to validate the input username and password; fetch the user from the user.Repository, and match their password to the stored hash.
 
@@ -5254,12 +5264,125 @@ func (s service) Refresh(ctx context.Context, username, token string) (*user.Ses
 }
 ```
 
+
+**`service.ParseToken`**
+
+`ParseToken` will be a "helper" method to identify a user by a JWT. It will be used on the transport layer since the service has access the user.Repository, to verify if that the user actually exists.
+
+1. Starting by the token itself, with its validation (ensuring it's not empty, and parsing it):
+
+```go
+	if token == "" {
+		return nil, fmt.Errorf("%w: token cannot be empty", ErrInvalidPassword)
+	}
+	t, err := s.auth.Parse(ctx, token)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse token: %v", err)
+	}
+```
+
+2. If valid, return the user identified by this username
+
+```go
+	u, err := s.users.Get(ctx, t.Username)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch user %s: %v", t.Username, err)
+	}
+
+	return u, nil
+```
+
+Quick and simple, here's the entire method:
+
+```go
+// ParseToken reads the input token string and returns the corresponding user in it, or an error
+func (s service) ParseToken(ctx context.Context, token string) (*user.User, error) {
+	if token == "" {
+		return nil, fmt.Errorf("%w: token cannot be empty", ErrInvalidPassword)
+	}
+
+	t, err := s.auth.Parse(ctx, token)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse token: %v", err)
+	}
+
+	u, err := s.users.Get(ctx, t.Username)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch user %s: %v", t.Username, err)
+	}
+
+	return u, nil
+}
+```
+
 Fantastic! The Service interface is implemented. Technically the app already works as a library, right now so cheers to that!
 
 Next step is to move over to the transport layer, as a HTTP API with JSON documents. Simple and straight-forward.
 ___________
 
 ### HTTP API implementation 
+
+For HTTP, I will use my own HTTP library on [`zalgonoise/x/ghttp`](https://github.com/zalgonoise/x/tree/master/ghttp). This is not reinventing the wheel in any way as it's using the standard library's HTTP server. The key difference in it is the use of generics to model the request and response data, to (try to) make is easier to design HTTP endpoints in Go.
+
+A `ghttp.Server` is based on a `http.Server`, and will create one if it's not provided. The idea is to supply a set of handlers as endpoints or routes, which point to handler funcs just like in the `http` package.
+
+The handler funcs are composed of a name, parse function and execution function, that compose the actual `http.HandlerFunc` type.
+
+#### Peek into `ghttp`
+
+This will be a short chapter describing the library I am using to contextualize the code in the endpoints chapters
+
+The package will export several types and functions, but the main focus is on the handlers:
+
+```go
+// ParseFn is a function that converts a HTTP request into a request object of the caller's choice
+type ParseFn[Q any] func(ctx context.Context, r *http.Request) (*Q, error)
+
+// QueryFn is a function that executes an action based on the input context `ctx` and query object `query`,
+// and returns a pointer to a Response for the answer type
+type ExecFn[Q any, A any] func(ctx context.Context, query *Q) *Response[A]
+
+// MiddlewareFn is a function that wraps a http.HandlerFunc, as HTTP middleware
+type MiddlewareFn func(next http.HandlerFunc) http.HandlerFunc
+
+// Do is a generic function that creates a HandlerFunc which will take in a context and a query object, and returns
+// a HTTP status, a response message, a response object and an error
+func Do[Q any, A any](name string, parseFn ParseFn[Q], queryFn ExecFn[Q, A]) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx, s := NewCtxAndSpan(r, name)
+		defer s.End()
+
+		if queryFn == nil {
+			panic("a query function must be specified")
+		}
+
+		var query = new(Q)
+		var err error
+
+		if parseFn != nil {
+			query, err = parseFn(ctx, r)
+			if err != nil {
+				NewResponse[A](http.StatusBadRequest, err.Error()).WriteHTTP(ctx, w)
+				return
+			}
+		}
+
+		queryFn(ctx, query).WriteHTTP(ctx, w)
+	}
+}
+```
+
+- `ParseFn` will read the HTTP request to build a query object (of the caller's choice). If you're creating a user, you can create a handler func that implements the (private) `usersCreateRequest` type, and your ParseFn returns this type after reading the request.
+
+- `ExecFn` will perform the call to the system, to satisfy the caller's request. It's mandatory to have one, even if no-op. The `ExecFn` accepts a query of the same type as the `ParseFn`'s return, and regardless if it's user or not, it will be initialized for the `ExecFn` call.
+
+- `MiddlewareFn` is a simple type to describe HTTP middleware
+
+- `Do` function is the actual `http.HandlerFunc` generator. It takes in a name (`string`) for observability (span name), a `ParseFn[Q]` (nullable), and an `ExecFn[Q, A]` (not-nil).
+
+These types are the main reason why I wrote the `ghttp` library. I personally feel it takes a lot of boilerplate away when using the standard library for HTTP APIs. The other features are used and *nice to have* but not nearly as important as these.
+
+#### Designing the endpoints
 
 #### Handling endpoints that require auth
 ___________
