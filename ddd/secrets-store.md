@@ -2994,10 +2994,10 @@ For the username there is already a validator function, but for the updated obje
 	}
 ```
 
-2. Get this user, from the user.Repository (from their username)
+2. Get this user, from the user.Repository (from their username). This will serve as the template object to alter with the new changes:
 
 ```go
-	currentUser, err := s.users.Get(ctx, username)
+	u, err := s.users.Get(ctx, username)
 	if err != nil {
 		return fmt.Errorf("failed to fetch original user %s: %v", username, err)
 	}
@@ -3006,15 +3006,17 @@ For the username there is already a validator function, but for the updated obje
 3. Verify if there are any actual changes to be made in this action. If not, simply return without an error (the desired state is already achieved).
 
 ```go
-	if updated.Name == currentUser.Name && updated.Hash == currentUser.Hash {
+	if updated.Name == u.Name {
+		// no changes to be made
 		return nil
 	}
+	u.Name = updated.Name
 ```
 
 4. Update the user by calling the `Update` user.Repository method
 
 ```go
-	err = s.users.Update(ctx, username, updated)
+	err = s.users.Update(ctx, username, u)
 	if err != nil {
 		return fmt.Errorf("failed to update user %s: %v", username, err)
 	}
@@ -3037,16 +3039,17 @@ func (s service) UpdateUser(ctx context.Context, username string, updated *user.
 		return fmt.Errorf("%w: %v", ErrInvalidName, err)
 	}
 
-	currentUser, err := s.users.Get(ctx, username)
+	u, err := s.users.Get(ctx, username)
 	if err != nil {
 		return fmt.Errorf("failed to fetch original user %s: %v", username, err)
 	}
-	if updated.Name == currentUser.Name && updated.Hash == currentUser.Hash {
+	if updated.Name == u.Name {
 		// no changes to be made
 		return nil
 	}
+	u.Name = updated.Name
 
-	err = s.users.Update(ctx, username, updated)
+	err = s.users.Update(ctx, username, u)
 	if err != nil {
 		return fmt.Errorf("failed to update user %s: %v", username, err)
 	}
@@ -5420,6 +5423,45 @@ Now, for the HTTP implementation. I've created a new top-level folder called `tr
         └─ users.go -- users handler funcs
 ```
 
+#### HTTP helpers
+
+Two reusable functions that I kept going back to were `getToken` and `getPath`, which are under `transport/http/helper.go`.
+
+- `getToken` will extract the token from the `*http.Request`, from its header. Returns the token and an OK boolean value
+
+- `getPath` will split the URL path (by its `/`) to extract identifiers
+
+Here are both helper functions:
+
+```go
+import (
+	"net/http"
+	"strings"
+)
+
+func getToken(r *http.Request) (string, bool) {
+	token := r.Header.Get("Authorization")
+	if token != "" {
+		t := strings.TrimPrefix(token, "Bearer ")
+		if t != "" {
+			return t, true
+		}
+	}
+	return "", false
+}
+
+func getPath(path string) []string {
+	splitPath := strings.Split(path, "/")
+	var out = make([]string, 0, len(splitPath))
+	for _, item := range splitPath {
+		if item != "" && item != " " && item != "\n" && item != "\t" {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+```
+
 
 #### Defining the server
 
@@ -5682,6 +5724,406 @@ func (s *server) usersGet() http.HandlerFunc {
 }
 ```
 
+
+**`server.usersList`**
+
+The `list` operation does not require any parameters, so in this handler, the `ParseFn` will be nil (there are no parameters to extract). The `ExecFn` fetches the list of users and sets it as the response data (if successful), as-is:
+
+```go
+func (s *server) usersList() http.HandlerFunc {
+	var execFn = func(ctx context.Context, q *any) *ghttp.Response[[]*user.User] {
+		dbuser, err := s.s.ListUsers(ctx)
+		if err != nil {
+			return ghttp.NewResponse[[]*user.User](http.StatusInternalServerError, err.Error())
+		}
+
+		return ghttp.NewResponse[[]*user.User](http.StatusOK, "user fetched successfully").WithData(&dbuser)
+	}
+
+	return ghttp.Do("UsersList", nil, execFn)
+}
+```
+
+**`server.usersUpdate`**
+
+For the update action, a couple of checks need to take place. Consider that the HTTP path will contain the target username (`/users/username`), so this username needs to match the user in the JWT; then it's a matter of passing the request through the service's `UpdateUser` method:
+
+1. Starting by defining a private type for the request. The username is present so it can be used, but it's not a field that the user will populate (this comes from the JWT and from the URL path):
+
+```go
+	type usersUpdateRequest struct {
+		Name     string `json:"name,omitempty"`
+		Username string `json:"-"`
+	}
+```
+
+2. For the `ParseFn`, I want to extract the username from the URL path, and read the request's body for the changes in the user (in this case the user's Name field). I can set the username from the path on the `usersUpdateRequest` object:
+
+```go
+	var parseFn = func(ctx context.Context, r *http.Request) (*usersUpdateRequest, error) {
+		prefix := "/users/"
+		username := r.URL.Path[len(prefix):]
+
+		if username == "" {
+			return nil, errors.New("no username provided")
+		}
+
+		u, err := ghttp.ReadBody[usersUpdateRequest](ctx, r)
+		if err != nil {
+			return nil, err
+		}
+		u.Username = username
+
+		// (...)
+	}
+```
+
+3. To ensure that user A is not trying to update user B's data, I verify that the caller is the same as the target user:
+
+
+```go
+	var parseFn = func(ctx context.Context, r *http.Request) (*usersUpdateRequest, error) {
+	// (...)
+		if caller, ok := authz.GetCaller(r); ok && caller == username {
+			return u, nil
+		}
+		return nil, authz.ErrInvalidUser
+	}
+```
+
+4. The `ExecFn` verifies that the object is not nil; and issues the `service.UpdateUser` call.
+
+```go
+	var execFn = func(ctx context.Context, q *usersUpdateRequest) *ghttp.Response[user.User] {
+		if q == nil {
+			return ghttp.NewResponse[user.User](http.StatusBadRequest, "invalid request")
+		}
+
+		u := &user.User{
+			Username: q.Username,
+		}
+
+		err := s.s.UpdateUser(ctx, q.Username, u)
+		if err != nil {
+			return ghttp.NewResponse[user.User](http.StatusInternalServerError, err.Error())
+		}
+
+		return ghttp.NewResponse[user.User](http.StatusOK, "user updated successfully").WithData(u)
+	}
+```
+
+5. Lastly, the remainder of the function's body is returning a `ghttp.Do` call:
+
+```go
+	return ghttp.Do("UsersUpdate", parseFn, execFn)
+```
+
+Here's the entire handler:
+
+```go
+func (s *server) usersUpdate() http.HandlerFunc {
+	type usersUpdateRequest struct {
+		Name     string `json:"name,omitempty"`
+		Username string `json:"-"`
+	}
+
+	var parseFn = func(ctx context.Context, r *http.Request) (*usersUpdateRequest, error) {
+		prefix := "/users/"
+		username := r.URL.Path[len(prefix):]
+
+		if username == "" {
+			return nil, errors.New("no username provided")
+		}
+
+		u, err := ghttp.ReadBody[usersUpdateRequest](ctx, r)
+		if err != nil {
+			return nil, err
+		}
+		u.Username = username
+
+		if caller, ok := authz.GetCaller(r); ok && caller == username {
+			return u, nil
+		}
+		return nil, authz.ErrInvalidUser
+	}
+
+	var execFn = func(ctx context.Context, q *usersUpdateRequest) *ghttp.Response[user.User] {
+		if q == nil {
+			return ghttp.NewResponse[user.User](http.StatusBadRequest, "invalid request")
+		}
+
+		u := &user.User{
+			Username: q.Username,
+		}
+
+		err := s.s.UpdateUser(ctx, q.Username, u)
+		if err != nil {
+			return ghttp.NewResponse[user.User](http.StatusInternalServerError, err.Error())
+		}
+
+		return ghttp.NewResponse[user.User](http.StatusOK, "user updated successfully").WithData(u)
+	}
+
+	return ghttp.Do("UsersUpdate", parseFn, execFn)
+}
+```
+
+
+**`server.usersDelete`**
+
+The `DELETE` call will be very similar to the `GET` one; as only the target's username is needed (and is taken from the URL path):
+
+1. For the `ParseFn` I will take the username from the URL path and compare it to the caller's username (so that user A isn't able to delete user B):
+
+```go
+	var parseFn = func(ctx context.Context, r *http.Request) (*string, error) {
+		prefix := "/users/"
+		username := r.URL.Path[len(prefix):]
+
+		if username == "" {
+			return nil, errors.New("no username provided")
+		}
+
+		if caller, ok := authz.GetCaller(r); ok && caller == username {
+			return &username, nil
+		}
+		return nil, authz.ErrInvalidUser
+	}
+```
+
+2. The `ExecFn` ensures that the username from the `ParseFn` is not nil or empty, and issues the `service.DeleteUser` call:
+
+```go
+	var execFn = func(ctx context.Context, q *string) *ghttp.Response[user.User] {
+		if q == nil || *q == "" {
+			return ghttp.NewResponse[user.User](http.StatusBadRequest, "invalid username")
+		}
+
+		err := s.s.DeleteUser(ctx, *q)
+		if err != nil {
+			if errors.Is(sqlite.ErrNotFoundUser, err) {
+				return ghttp.NewResponse[user.User](http.StatusNotFound, err.Error())
+			}
+			return ghttp.NewResponse[user.User](http.StatusInternalServerError, err.Error())
+		}
+
+		return ghttp.NewResponse[user.User](http.StatusOK, "user deleted successfully")
+	}
+```
+
+3. Lastly, the function just returns a call to `ghttp.Do`:
+
+```go
+	return ghttp.Do("UsersDelete", parseFn, execFn)
+```
+
+Here's the entire function:
+
+```go
+func (s *server) usersDelete() http.HandlerFunc {
+	var parseFn = func(ctx context.Context, r *http.Request) (*string, error) {
+		prefix := "/users/"
+		username := r.URL.Path[len(prefix):]
+
+		if username == "" {
+			return nil, errors.New("no username provided")
+		}
+
+		if caller, ok := authz.GetCaller(r); ok && caller == username {
+			return &username, nil
+		}
+		return nil, authz.ErrInvalidUser
+	}
+
+	var execFn = func(ctx context.Context, q *string) *ghttp.Response[user.User] {
+		if q == nil || *q == "" {
+			return ghttp.NewResponse[user.User](http.StatusBadRequest, "invalid username")
+		}
+
+		err := s.s.DeleteUser(ctx, *q)
+		if err != nil {
+			if errors.Is(sqlite.ErrNotFoundUser, err) {
+				return ghttp.NewResponse[user.User](http.StatusNotFound, err.Error())
+			}
+			return ghttp.NewResponse[user.User](http.StatusInternalServerError, err.Error())
+		}
+
+		return ghttp.NewResponse[user.User](http.StatusOK, "user deleted successfully")
+	}
+
+	return ghttp.Do("UsersDelete", parseFn, execFn)
+}
+```
+
+
+**`server.secretsCreate`**
+
+The remaining endpoints will be very similar. For this function's `ParseFn`, the key and value are read from the request's body, and the user's username is extracted from the JWT. As for the `ExecFn`, like the ones before it, checks for the request object, then passes the request onto the service. It also calls `service.GetSecret` so the entry is returned to the user. Here's `server.secretsCreate`:
+
+```go
+
+func (s *server) secretsCreate() http.HandlerFunc {
+	type secretsCreateRequest struct {
+		Username string `json:"-"`
+		Key      string `json:"key,omitempty"`
+		Value    string `json:"value,omitempty"`
+	}
+	var parseFn = func(ctx context.Context, r *http.Request) (*secretsCreateRequest, error) {
+		secr, err := ghttp.ReadBody[secretsCreateRequest](ctx, r)
+		if err != nil {
+			return nil, err
+		}
+		if u, ok := authz.GetCaller(r); ok {
+			secr.Username = u
+			return secr, nil
+		}
+		return nil, authz.ErrInvalidUser
+	}
+
+	var execFn = func(ctx context.Context, q *secretsCreateRequest) *ghttp.Response[secret.Secret] {
+		if q == nil {
+			return ghttp.NewResponse[secret.Secret](http.StatusBadRequest, "invalid request")
+		}
+
+		err := s.s.CreateSecret(ctx, q.Username, q.Key, []byte(q.Value))
+		if err != nil {
+			return ghttp.NewResponse[secret.Secret](http.StatusInternalServerError, err.Error())
+		}
+
+		secr, err := s.s.GetSecret(ctx, q.Username, q.Key)
+		if err != nil {
+			return ghttp.NewResponse[secret.Secret](http.StatusInternalServerError, err.Error())
+		}
+		return ghttp.NewResponse[secret.Secret](http.StatusOK, "secret created successfully").WithData(secr)
+	}
+
+	return ghttp.Do("SecretsCreate", parseFn, execFn)
+}
+```
+
+**`server.secretsGet`**
+
+Under the same context, the `GET` operation will only extract the sercret's key from the URL path while the username is still taken from the JWT:
+
+```go
+func (s *server) secretsGet() http.HandlerFunc {
+	type secretsGetRequest struct {
+		Username string `json:"-"`
+		Key      string `json:"-"`
+	}
+	var parseFn = func(ctx context.Context, r *http.Request) (*secretsGetRequest, error) {
+		splitPath := getPath(r.URL.Path)
+		key := splitPath[1]
+
+		if u, ok := authz.GetCaller(r); ok {
+			return &secretsGetRequest{
+				Username: u,
+				Key:      key,
+			}, nil
+		}
+		return nil, authz.ErrInvalidUser
+	}
+
+	var execFn = func(ctx context.Context, q *secretsGetRequest) *ghttp.Response[secret.Secret] {
+		if q == nil {
+			return ghttp.NewResponse[secret.Secret](http.StatusBadRequest, "invalid request")
+		}
+
+		dbsecr, err := s.s.GetSecret(ctx, q.Username, q.Key)
+		if err != nil {
+			if errors.Is(sqlite.ErrNotFoundSecret, err) {
+				return ghttp.NewResponse[secret.Secret](http.StatusNotFound, err.Error())
+			}
+			return ghttp.NewResponse[secret.Secret](http.StatusInternalServerError, err.Error())
+		}
+
+		return ghttp.NewResponse[secret.Secret](http.StatusOK, "secret fetched successfully").WithData(dbsecr)
+	}
+
+	return ghttp.Do("SecretsGet", parseFn, execFn)
+}
+```
+
+**`server.secretsList`**
+
+Just like the `secretsGet` call, `secretsList` will only retrieve the username from the JWT to list all of the caller's secrets:
+
+```go
+func (s *server) secretsList() http.HandlerFunc {
+	var parseFn = func(ctx context.Context, r *http.Request) (*string, error) {
+		if u, ok := authz.GetCaller(r); ok {
+			return &u, nil
+		}
+		return nil, authz.ErrInvalidUser
+	}
+
+	var execFn = func(ctx context.Context, q *string) *ghttp.Response[[]*secret.Secret] {
+		if q == nil || *q == "" {
+			return ghttp.NewResponse[[]*secret.Secret](http.StatusBadRequest, "invalid username")
+		}
+
+		dbsecr, err := s.s.ListSecrets(ctx, *q)
+		if err != nil {
+			return ghttp.NewResponse[[]*secret.Secret](http.StatusInternalServerError, err.Error())
+		}
+
+		return ghttp.NewResponse[[]*secret.Secret](http.StatusOK, "secrets listed successfully").WithData(&dbsecr)
+	}
+
+	return ghttp.Do("SecretsList", parseFn, execFn)
+}
+```
+
+**`server.secretsDelete`**
+
+Still looking at the `DELETE` operation like a `GET` operation, the key is taken from the URL path and the username from the JWT. Then, the service takes care of the secret's removal:
+
+```go
+func (s *server) secretsDelete() http.HandlerFunc {
+	type secretsDeleteRequest struct {
+		Username string `json:"-"`
+		Key      string `json:"-"`
+	}
+	var parseFn = func(ctx context.Context, r *http.Request) (*secretsDeleteRequest, error) {
+		splitPath := getPath(r.URL.Path)
+		key := splitPath[1]
+
+		if u, ok := authz.GetCaller(r); ok {
+			return &secretsDeleteRequest{
+				Username: u,
+				Key:      key,
+			}, nil
+		}
+		return nil, authz.ErrInvalidUser
+	}
+
+	var execFn = func(ctx context.Context, q *secretsDeleteRequest) *ghttp.Response[secret.Secret] {
+		if q == nil {
+			return ghttp.NewResponse[secret.Secret](http.StatusBadRequest, "invalid request")
+		}
+
+		err := s.s.DeleteSecret(ctx, q.Username, q.Key)
+		if err != nil {
+			return ghttp.NewResponse[secret.Secret](http.StatusInternalServerError, err.Error())
+		}
+
+		return ghttp.NewResponse[secret.Secret](http.StatusOK, "secret deleted successfully")
+	}
+
+	return ghttp.Do("SecretsDelete", parseFn, execFn)
+}
+```
+
+
+**`server.sharesCreate`**
+**`server.sharesGet`**
+**`server.sharesList`**
+**`server.sharesDelete`**
+
+**`server.login`**
+**`server.logout`**
+**`server.changePassword`**
+**`server.refresh`**
 
 #### Handling endpoints that require auth
 ___________
