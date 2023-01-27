@@ -6116,19 +6116,1006 @@ func (s *server) secretsDelete() http.HandlerFunc {
 
 
 **`server.sharesCreate`**
+
+A quick note before diving into this handler, note how the `sharesCreate` endpoint points to `/secrets/{secretKey}/share`, as opposed to the rest of the `/shares/` endpoints.
+
+1. Like before, starting by defining a private type for the request. The owner's username and secret's key are derived from the JWT and URL path respectively. The `Until` and `For` fields are nullable to allow for calling the right service method.
+
+```go
+	type sharesCreateRequest struct {
+		Owner   string         `json:"-"`
+		Key     string         `json:"-"`
+		Targets []string       `json:"targets,omitempty"`
+		Until   *time.Time     `json:"until,omitempty"`
+		For     *time.Duration `json:"for,omitempty"`
+	}
+```
+
+2. For the `ParseFn`, I need to read the body and get the remaining parameters from the JWT and URL path:
+
+```go
+	var parseFn = func(ctx context.Context, r *http.Request) (*sharesCreateRequest, error) {
+		req, err := ghttp.ReadBody[sharesCreateRequest](ctx, r)
+		if err != nil {
+			return nil, err
+		}
+		caller, ok := authz.GetCaller(r)
+
+		if !ok {
+			return nil, errors.New("invalid username")
+		}
+
+		req.Owner = caller
+		req.Key = getPath(r.URL.Path)[1]
+		return req, nil
+	}
+```
+
+3. The `ExecFn` will execute the appropriate `service` call to share the secret. For this I look into which field was populated, defaulting to the `CreateShare` method when no duration or time is defined:
+
+```go
+	var execFn = func(ctx context.Context, q *sharesCreateRequest) *ghttp.Response[shared.Share] {
+		if q == nil {
+			span.Event("empty object error")
+			return ghttp.NewResponse[shared.Share](http.StatusBadRequest, "empty request")
+		}
+
+		var (
+			newShare *shared.Share
+			err      error
+		)
+
+		if q.Until != nil {
+			newShare, err = s.s.ShareUntil(ctx, q.Owner, q.Key, *q.Until, q.Targets...)
+		} else if q.For != nil {
+			newShare, err = s.s.ShareFor(ctx, q.Owner, q.Key, *q.For, q.Targets...)
+		} else {
+			newShare, err = s.s.CreateShare(ctx, q.Owner, q.Key, q.Targets...)
+		}
+
+		if err != nil {
+			return ghttp.NewResponse[shared.Share](http.StatusInternalServerError, err.Error())
+		}
+		return ghttp.NewResponse[shared.Share](http.StatusOK, "secret shared successfully").WithData(newShare)
+	}
+```
+
+4. Lastly, returning a `ghttp.Do` call:
+
+```go
+	return ghttp.Do("SharesCreate", parseFn, execFn)
+```
+
+Here's the entire function:
+
+```go
+func (s *server) sharesCreate() http.HandlerFunc {
+	type sharesCreateRequest struct {
+		Owner   string         `json:"-"`
+		Key     string         `json:"-"`
+		Targets []string       `json:"targets,omitempty"`
+		Until   *time.Time     `json:"until,omitempty"`
+		For     *time.Duration `json:"for,omitempty"`
+	}
+	var parseFn = func(ctx context.Context, r *http.Request) (*sharesCreateRequest, error) {
+		req, err := ghttp.ReadBody[sharesCreateRequest](ctx, r)
+		if err != nil {
+			return nil, err
+		}
+		caller, ok := authz.GetCaller(r)
+		if !ok {
+			return nil, errors.New("invalid username")
+		}
+
+		req.Owner = caller
+		req.Key = getPath(r.URL.Path)[1]
+		return req, nil
+	}
+
+	var execFn = func(ctx context.Context, q *sharesCreateRequest) *ghttp.Response[shared.Share] {
+		ctx, span := spanner.Start(ctx, "SharesCreate")
+		span.Add(attr.New("req", q))
+
+		if q == nil {
+			span.Event("empty object error")
+			return ghttp.NewResponse[shared.Share](http.StatusBadRequest, "empty request")
+		}
+
+		var (
+			newShare *shared.Share
+			err      error
+		)
+
+		if q.Until != nil {
+			newShare, err = s.s.ShareUntil(ctx, q.Owner, q.Key, *q.Until, q.Targets...)
+		} else if q.For != nil {
+			newShare, err = s.s.ShareFor(ctx, q.Owner, q.Key, *q.For, q.Targets...)
+		} else {
+			newShare, err = s.s.CreateShare(ctx, q.Owner, q.Key, q.Targets...)
+		}
+
+		if err != nil {
+			return ghttp.NewResponse[shared.Share](http.StatusInternalServerError, err.Error())
+		}
+		span.Event("operation successful", attr.New("share", newShare))
+		return ghttp.NewResponse[shared.Share](http.StatusOK, "secret shared successfully").WithData(newShare)
+	}
+
+	return ghttp.Do("SharesCreate", parseFn, execFn)
+}
+```
+
 **`server.sharesGet`**
+
+For the `GET` operation, no parameters are retrieved from the request body. The username will come from the JWT and the secret key will come from the URL path:
+
+```go
+func (s *server) sharesGet() http.HandlerFunc {
+	type sharesGetRequest struct {
+		Owner string
+		Key   string
+	}
+	var parseFn = func(ctx context.Context, r *http.Request) (*sharesGetRequest, error) {
+		req := new(sharesGetRequest)
+		caller, ok := authz.GetCaller(r)
+		if !ok {
+			return nil, errors.New("invalid username")
+		}
+
+		req.Owner = caller
+		req.Key = getPath(r.URL.Path)[1]
+		return req, nil
+	}
+
+	var execFn = func(ctx context.Context, q *sharesGetRequest) *ghttp.Response[[]*shared.Share] {
+		if q == nil {
+			span.Event("empty object error")
+			return ghttp.NewResponse[[]*shared.Share](http.StatusBadRequest, "empty request")
+		}
+
+		shares, err := s.s.GetShare(ctx, q.Owner, q.Key)
+		if err != nil {
+			return ghttp.NewResponse[[]*shared.Share](http.StatusInternalServerError, err.Error())
+		}
+		return ghttp.NewResponse[[]*shared.Share](http.StatusOK, "shared secret fetched successfully").WithData(&shares)
+	}
+
+	return ghttp.Do("SharesGet", parseFn, execFn)
+}
+```
+
 **`server.sharesList`**
+
+A `GET` operation without a secret key is a list operation, so same as the above but simpler:
+
+```go
+func (s *server) sharesList() http.HandlerFunc {
+	var parseFn = func(ctx context.Context, r *http.Request) (*string, error) {
+		if caller, ok := authz.GetCaller(r); ok {
+			return &caller, nil
+		}
+		return nil, errors.New("invalid username")
+	}
+
+	var execFn = func(ctx context.Context, q *string) *ghttp.Response[[]*shared.Share] {
+		ctx, span := spanner.Start(ctx, "SharesList")
+		span.Add(attr.New("req", q))
+
+		if q == nil {
+			span.Event("empty object error")
+			return ghttp.NewResponse[[]*shared.Share](http.StatusBadRequest, "empty request")
+		}
+
+		shares, err := s.s.ListShares(ctx, *q)
+		if err != nil {
+			return ghttp.NewResponse[[]*shared.Share](http.StatusInternalServerError, err.Error())
+		}
+		span.Event("operation successful", attr.New("share", shares))
+		return ghttp.NewResponse[[]*shared.Share](http.StatusOK, "shared secrets listed successfully").WithData(&shares)
+	}
+
+	return ghttp.Do("SharesList", parseFn, execFn)
+}
+```
+
 **`server.sharesDelete`**
 
+The `DELETE` operation serves for `service.DeleteShare` and `service.PurgeShares` alike; depending on whether the caller specifies a (list of)
+target(s) or not.
+
+```go
+
+func (s *server) sharesDelete() http.HandlerFunc {
+	type sharesDeleteRequest struct {
+		Owner   string   `json:"-"`
+		Key     string   `json:"-"`
+		Targets []string `json:"targets,omitempty"`
+	}
+	var parseFn = func(ctx context.Context, r *http.Request) (*sharesDeleteRequest, error) {
+		req, err := ghttp.ReadBody[sharesDeleteRequest](ctx, r)
+		if err != nil {
+			req = new(sharesDeleteRequest)
+		}
+		caller, ok := authz.GetCaller(r)
+		if !ok {
+			return nil, errors.New("invalid username")
+		}
+
+		req.Owner = caller
+		req.Key = getPath(r.URL.Path)[1]
+		return req, nil
+	}
+
+	var execFn = func(ctx context.Context, q *sharesDeleteRequest) *ghttp.Response[shared.Share] {
+		ctx, span := spanner.Start(ctx, "SharesDelete")
+		span.Add(attr.New("req", q))
+
+		if q == nil {
+			span.Event("empty object error")
+			return ghttp.NewResponse[shared.Share](http.StatusBadRequest, "empty request")
+		}
+
+		var err error
+
+		if len(q.Targets) > 0 {
+			err = s.s.DeleteShare(ctx, q.Owner, q.Key, q.Targets...)
+		} else {
+			err = s.s.PurgeShares(ctx, q.Owner, q.Key)
+		}
+
+		if err != nil {
+			return ghttp.NewResponse[shared.Share](http.StatusInternalServerError, err.Error())
+		}
+		span.Event("operation successful")
+		return ghttp.NewResponse[shared.Share](http.StatusOK, "secret share removed successfully")
+	}
+
+	return ghttp.Do("SharesDelete", parseFn, execFn)
+}
+
+```
+
 **`server.login`**
+
+Now for the authentication endpoints! Starting with the most important of all: `login`. Taking it step by step
+
+1. Defining the private type for the request:
+
+```go
+	type loginRequest struct {
+		Username string `json:"username,omitempty"`
+		Password string `json:"password,omitempty"`
+	}
+```
+
+2. Then, the `ParseFn`. This part will leverage the `ghttp.ReadBody` function entirely:
+
+```go
+	var parseFn = func(ctx context.Context, r *http.Request) (*loginRequest, error) {
+		return ghttp.ReadBody[loginRequest](ctx, r)
+	}
+```
+
+3. The `ExecFn` is going to issue this request to the service, and look into the error received (if it's not found or invalid credentials) to return the appropriate error and status code. If all goes well, a `*user.Session` is returned to the user:
+
+```go
+	var execFn = func(ctx context.Context, q *loginRequest) *ghttp.Response[user.Session] {
+		if q == nil {
+			return ghttp.NewResponse[user.Session](http.StatusBadRequest, "invalid request")
+		}
+
+		dbsession, err := s.s.Login(ctx, q.Username, q.Password)
+		if err != nil {
+			if errors.Is(sqlite.ErrNotFoundUser, err) {
+				return ghttp.NewResponse[user.Session](http.StatusNotFound, err.Error())
+			}
+			if errors.Is(service.ErrIncorrectPassword, err) {
+				return ghttp.NewResponse[user.Session](http.StatusBadRequest, err.Error())
+			}
+			return ghttp.NewResponse[user.Session](http.StatusInternalServerError, err.Error())
+		}
+
+		return ghttp.NewResponse[user.Session](http.StatusOK, "user logged in successfully").WithData(dbsession)
+	}
+```
+
+4. Lastly, return a `ghttp.Do` call:
+
+```go
+	return ghttp.Do("Login", parseFn, execFn)
+```
+
+The entire method looks like:
+
+```go
+func (s *server) login() http.HandlerFunc {
+	type loginRequest struct {
+		Username string `json:"username,omitempty"`
+		Password string `json:"password,omitempty"`
+	}
+
+	var parseFn = func(ctx context.Context, r *http.Request) (*loginRequest, error) {
+		return ghttp.ReadBody[loginRequest](ctx, r)
+	}
+
+	var execFn = func(ctx context.Context, q *loginRequest) *ghttp.Response[user.Session] {
+		if q == nil {
+			return ghttp.NewResponse[user.Session](http.StatusBadRequest, "invalid request")
+		}
+
+		dbsession, err := s.s.Login(ctx, q.Username, q.Password)
+		if err != nil {
+			if errors.Is(sqlite.ErrNotFoundUser, err) {
+				return ghttp.NewResponse[user.Session](http.StatusNotFound, err.Error())
+			}
+			if errors.Is(service.ErrIncorrectPassword, err) {
+				return ghttp.NewResponse[user.Session](http.StatusBadRequest, err.Error())
+			}
+			return ghttp.NewResponse[user.Session](http.StatusInternalServerError, err.Error())
+		}
+
+		return ghttp.NewResponse[user.Session](http.StatusOK, "user logged in successfully").WithData(dbsession)
+	}
+
+	return ghttp.Do("Login", parseFn, execFn)
+}
+```
+
 **`server.logout`**
+
+The `logout` endpoint just reads the caller's username from the JWT on the `ParseFn` and issues a `service.Logout` call on the `ExecFn`:
+
+```go
+func (s *server) logout() http.HandlerFunc {
+	var parseFn = func(ctx context.Context, r *http.Request) (*string, error) {
+		caller, ok := authz.GetCaller(r)
+		if ok {
+			return &caller, nil
+		}
+		return nil, errors.New("failed to read password or token in request")
+	}
+
+	var execFn = func(ctx context.Context, q *string) *ghttp.Response[user.Session] {
+		if q == nil || *q == "" {
+			return ghttp.NewResponse[user.Session](http.StatusBadRequest, "invalid request")
+		}
+
+		err := s.s.Logout(ctx, *q)
+		if err != nil {
+			if errors.Is(sqlite.ErrNotFoundUser, err) {
+				return ghttp.NewResponse[user.Session](http.StatusNotFound, err.Error())
+			}
+			return ghttp.NewResponse[user.Session](http.StatusInternalServerError, err.Error())
+		}
+
+		return ghttp.NewResponse[user.Session](http.StatusOK, "user logged out successfully")
+	}
+
+	return ghttp.Do("Logout", parseFn, execFn)
+}
+```
+
 **`server.changePassword`**
+
+A password change request must be similar to a login request, as in, the user will submit the current password despite their (valid) JWT. It will also accept the new password that will be used in the corresponding `service.ChangePassword` call.
+
+1. Starting by defining a private type for the request:
+
+```go
+	type changePasswordRequest struct {
+		Username    string `json:"-"`
+		Password    string `json:"password,omitempty"`
+		NewPassword string `json:"new_password,omitempty"`
+	}
+```
+
+2. Then write a `ParseFn` that reads the body and gets the username from the JWT:
+
+```go
+	var parseFn = func(ctx context.Context, r *http.Request) (*changePasswordRequest, error) {
+		req, err := ghttp.ReadBody[changePasswordRequest](ctx, r)
+		if err != nil {
+			return nil, err
+		}
+
+		if caller, ok := authz.GetCaller(r); ok {
+			req.Username = caller
+			return req, nil
+		}
+		return nil, authz.ErrInvalidUser
+	}
+```
+
+3. Then, the `ExecFn` issues the `service.ChangePassword` call:
+
+```go
+	var execFn = func(ctx context.Context, q *changePasswordRequest) *ghttp.Response[user.Session] {
+		if q == nil {
+			return ghttp.NewResponse[user.Session](http.StatusBadRequest, "invalid request")
+		}
+
+		err := s.s.ChangePassword(ctx, q.Username, q.Password, q.NewPassword)
+		if err != nil {
+			if errors.Is(sqlite.ErrNotFoundUser, err) {
+				return ghttp.NewResponse[user.Session](http.StatusNotFound, err.Error())
+			}
+			if errors.Is(service.ErrIncorrectPassword, err) {
+				return ghttp.NewResponse[user.Session](http.StatusBadRequest, err.Error())
+			}
+			return ghttp.NewResponse[user.Session](http.StatusInternalServerError, err.Error())
+		}
+
+		return ghttp.NewResponse[user.Session](http.StatusOK, "password changed successfully")
+	}
+```
+
+4. And returning a `ghttp.Do` call:
+
+```go
+	return ghttp.Do("ChangePassword", parseFn, execFn)
+```
+
+Here's the entire function:
+
+```go
+func (s *server) changePassword() http.HandlerFunc {
+	type changePasswordRequest struct {
+		Username    string `json:"-"`
+		Password    string `json:"password,omitempty"`
+		NewPassword string `json:"new_password,omitempty"`
+	}
+
+	var parseFn = func(ctx context.Context, r *http.Request) (*changePasswordRequest, error) {
+		req, err := ghttp.ReadBody[changePasswordRequest](ctx, r)
+		if err != nil {
+			return nil, err
+		}
+
+		if caller, ok := authz.GetCaller(r); ok {
+			req.Username = caller
+			return req, nil
+		}
+		return nil, authz.ErrInvalidUser
+	}
+
+	var execFn = func(ctx context.Context, q *changePasswordRequest) *ghttp.Response[user.Session] {
+		if q == nil {
+			return ghttp.NewResponse[user.Session](http.StatusBadRequest, "invalid request")
+		}
+
+		err := s.s.ChangePassword(ctx, q.Username, q.Password, q.NewPassword)
+		if err != nil {
+			if errors.Is(sqlite.ErrNotFoundUser, err) {
+				return ghttp.NewResponse[user.Session](http.StatusNotFound, err.Error())
+			}
+			if errors.Is(service.ErrIncorrectPassword, err) {
+				return ghttp.NewResponse[user.Session](http.StatusBadRequest, err.Error())
+			}
+			return ghttp.NewResponse[user.Session](http.StatusInternalServerError, err.Error())
+		}
+
+		return ghttp.NewResponse[user.Session](http.StatusOK, "password changed successfully")
+	}
+
+	return ghttp.Do("ChangePassword", parseFn, execFn)
+}
+```
+
 **`server.refresh`**
 
-#### Handling endpoints that require auth
+The data for the refresh request is retrieved in the `ParseFn` from the JWT and the user's request body (to ensure the usernames match, and the caller is not just trying to renew a valid JWT they stumbled upon). In the `ExecFn`, the service calls its `Refresh` method:
+
+
+```go
+func (s *server) refresh() http.HandlerFunc {
+	type refreshRequest struct {
+		Username string `json:"username,omitempty"`
+		Token    string `json:"-"`
+	}
+	var parseFn = func(ctx context.Context, r *http.Request) (*refreshRequest, error) {
+		q, err := ghttp.ReadBody[refreshRequest](ctx, r)
+		if err != nil {
+			return nil, err
+		}
+		if token, ok := getToken(r); ok {
+			q.Token = token
+		}
+		if caller, ok := authz.GetCaller(r); ok && caller == q.Username {
+			return q, nil
+		}
+
+		return nil, authz.ErrInvalidUser
+	}
+
+	var execFn = func(ctx context.Context, q *refreshRequest) *ghttp.Response[user.Session] {
+		if q == nil {
+			return ghttp.NewResponse[user.Session](http.StatusBadRequest, "invalid request")
+		}
+
+		token, err := s.s.Refresh(ctx, q.Username, q.Token)
+		if err != nil {
+			if errors.Is(sqlite.ErrNotFoundUser, err) {
+				return ghttp.NewResponse[user.Session](http.StatusNotFound, err.Error())
+			}
+			if errors.Is(service.ErrIncorrectPassword, err) {
+				return ghttp.NewResponse[user.Session](http.StatusBadRequest, err.Error())
+			}
+			return ghttp.NewResponse[user.Session](http.StatusInternalServerError, err.Error())
+		}
+
+		return ghttp.NewResponse[user.Session](http.StatusOK, "token refreshed successfully").WithData(token)
+	}
+
+	return ghttp.Do("Refresh", parseFn, execFn)
+}
+```
+
+Awesome! All endpoints are wired up to the service. I really enjoy this part where we just start connecting packages and modules together. Time to wire up the endpoints with a multiplexer, for all the different paths to be evaluated as intended.
+
+
+#### Adding auth middleware
+
+In the `transport/http/middleware.go` file, I will include the authorization middleware, as a server method, `server.WithAuth`. The method will retrieve the token from the request, and parse it. If it's valid, then the caller's identity (their username) is set as a context value through the `authz.SignRequest` function.
+
+If the token is missing or invalid, a not found error is returned. This is a very simple approach to middleware, whether it is for auth, logging, metrics, traces, anything that involves processing a request *before* it hits the service:
+
+
+```go
+import (
+	"net/http"
+
+	"github.com/zalgonoise/x/ghttp"
+	"github.com/zalgonoise/x/secr/authz"
+)
+
+// WithAuth is middleware to validate JWT in request headers, for sensitive endpoints
+func (s *server) WithAuth() ghttp.MiddlewareFn {
+	return func(next http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			if token, ok := getToken(r); ok {
+				u, err := s.s.ParseToken(r.Context(), token)
+				if err == nil {
+					// wrap caller info in context
+					next(w, authz.SignRequest(u.Username, r))
+					return
+				}
+			}
+
+			http.Error(w, "not found", http.StatusNotFound)
+		}
+	}
+}
+
+```
+
+
+#### Defining the routes
+
+The `ghttp` package adds a couple of tools to handle these just as well, with a `ghttp.Endpoints` type and lists of `ghttp.Handler`. Let me cover those types first:
+
+```go
+// NewMux creates a http mux based off of a set of Handlers that share the
+// same path, but present different HandlerFuncs for different HTTP methods
+//
+// Middleware funcs are applied to the HandlerFunc, in the Routes map, in the mux.
+func NewRouter(handlers ...Handler) http.Handler {
+	if len(handlers) == 0 {
+		return nil
+	}
+	p := handlers[0].Path
+	m := &router{
+		Path:   p,
+		Routes: make(map[string]http.HandlerFunc),
+	}
+
+	for _, h := range handlers {
+		if h.Path != p {
+			continue
+		}
+		var fn = h.Fn
+		for i := len(h.Middleware) - 1; i >= 0; i-- {
+			fn = h.Middleware[i](fn)
+		}
+
+		m.Routes[h.Method] = fn
+	}
+	return m
+}
+
+// Handler is a basic path-to-HandlerFunc pair
+type Handler struct {
+	Method     string
+	Path       string
+	Fn         http.HandlerFunc
+	Middleware []MiddlewareFn
+}
+
+// NewHandler joins a path with a HandlerFunc, returning a Handler
+func NewHandler(method, path string, fn http.HandlerFunc, middleware ...MiddlewareFn) Handler {
+	return Handler{
+		Method:     method,
+		Path:       path,
+		Fn:         fn,
+		Middleware: middleware,
+	}
+}
+```
+
+And...
+
+```go
+// Endpoints maps URL paths to a list of Handlers
+type Endpoints map[string][]Handler
+
+// NewEndpoints initializes an Endpoints object
+func NewEndpoints() Endpoints {
+	return make(map[string][]Handler)
+}
+
+// Set adds the handlers to the Endpoints map
+func (e Endpoints) Set(handlers ...Handler) {
+	for _, h := range handlers {
+		e[h.Path] = append(e[h.Path], h)
+	}
+}
+```
+
+With these, I will write methods for different routes (users, secrets, shares and sessions) which will cascade into other `http.HandlerFunc` if needed.
+
+The simplest is sessions'. This method simply returns a list of `ghttp.Handler` configured with the (top-level) endpoints for sessions. I will use `http` package's constants for the HTTP methods. As for auth, just like the HTTP endpoints schema points out, all endpoints besides `login` and `usersCreate` require auth:
+
+```go
+func (s *server) sessionsHandler() []ghttp.Handler {
+	return []ghttp.Handler{
+		{
+			Method: http.MethodPost,
+			Path:   "/login",
+			Fn:     s.login(),
+		},
+		{
+			Method: http.MethodPost,
+			Path:   "/logout",
+			Fn:     s.logout(),
+			Middleware: []ghttp.MiddlewareFn{
+				s.WithAuth(),
+			},
+		},
+		{
+			Method: http.MethodPost,
+			Path:   "/recover",
+			Fn:     s.changePassword(),
+			Middleware: []ghttp.MiddlewareFn{
+				s.WithAuth(),
+			},
+		},
+		{
+			Method: http.MethodPost,
+			Path:   "/refresh",
+			Fn:     s.refresh(),
+			Middleware: []ghttp.MiddlewareFn{
+				s.WithAuth(),
+			},
+		},
+	}
+}
+```
+
+Simple, right? But it will get more complex. For instance for users. There are actions that will hit `/users/` (create, list) while others will hit `/users/{username}`. For this type of routing, I will just cascade the `http.HandlerFunc` into another, so that I can evaluate the URL path before calling a handler:
+
+```go
+const userPath = "users"
+
+func (s *server) usersHandler() []ghttp.Handler {
+	p := "/users/"
+	return []ghttp.Handler{
+		{
+			Method: http.MethodPost,
+			Path:   p,
+			Fn:     s.usersCreate(),
+		},
+		{
+			Method: http.MethodGet,
+			Path:   p,
+			Fn:     s.usersGetRoute(),
+			Middleware: []ghttp.MiddlewareFn{
+				s.WithAuth(),
+			},
+		},
+		{
+			Method: http.MethodDelete,
+			Path:   p,
+			Fn:     s.usersDelete(),
+			Middleware: []ghttp.MiddlewareFn{
+				s.WithAuth(),
+			},
+		},
+		{
+			Method: http.MethodPut,
+			Path:   p,
+			Fn:     s.usersUpdate(),
+			Middleware: []ghttp.MiddlewareFn{
+				s.WithAuth(),
+			},
+		},
+	}
+}
+
+func (s *server) usersGetRoute() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		splitPath := getPath(r.URL.Path)
+		switch len(splitPath) {
+		case 1:
+			if splitPath[0] == userPath {
+				s.usersList()(w, r)
+				return
+			}
+		case 2:
+			if splitPath[0] == userPath {
+				s.usersGet()(w, r)
+				return
+			}
+		default:
+			http.Error(w, "not found", http.StatusNotFound)
+		}
+	}
+}
+```
+
+The `usersGetRoute` method simply splits the URL path and evaluates whether it's specifying a username or not.
+
+It becomes very similar in the other routes, even in the secrets route which involves `/secrets/{secretKey}/share`:
+
+```go
+const secrPath = "secrets"
+const shareAction = "share"
+
+func (s *server) secretsHandler() []ghttp.Handler {
+	p := "/secrets/"
+	return []ghttp.Handler{
+		{
+			Method: http.MethodGet,
+			Path:   p,
+			Fn:     s.secretsGetRoute(),
+			Middleware: []ghttp.MiddlewareFn{
+				s.WithAuth(),
+			},
+		},
+		{
+			Method: http.MethodPost,
+			Path:   p,
+			Fn:     s.secretsCreateRoute(),
+			Middleware: []ghttp.MiddlewareFn{
+				s.WithAuth(),
+			},
+		},
+		{
+			Method: http.MethodDelete,
+			Path:   p,
+			Fn:     s.secretsDelete(),
+			Middleware: []ghttp.MiddlewareFn{
+				s.WithAuth(),
+			},
+		},
+	}
+}
+
+func (s *server) secretsGetRoute() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		splitPath := getPath(r.URL.Path)
+		switch len(splitPath) {
+		case 1:
+			if splitPath[0] == secrPath {
+				s.secretsList()(w, r)
+				return
+			}
+		case 2:
+			if splitPath[0] == secrPath {
+				s.secretsGet()(w, r)
+				return
+			}
+		default:
+			http.Error(w, "not found", http.StatusNotFound)
+		}
+	}
+}
+
+func (s *server) secretsCreateRoute() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		splitPath := getPath(r.URL.Path)
+		switch len(splitPath) {
+		case 1:
+			if splitPath[0] == secrPath {
+				s.secretsCreate()(w, r)
+				return
+			}
+		case 3:
+			if splitPath[0] == secrPath && splitPath[2] == shareAction {
+				s.sharesCreate()(w, r)
+				return
+			}
+		default:
+			http.Error(w, "not found", http.StatusNotFound)
+		}
+	}
+}
+```
+
+In this route, not only there's a (sub-)route for the `GET` operation (for list and get), and for the `POST` operation (for `CreateSecret` and `CreateShare`).
+
+As for the shares, it has less endpoints, but the same route on the `GET` method:
+
+```go
+const sharePath = "shares"
+
+func (s *server) sharesHandler() []ghttp.Handler {
+	p := "/shares/"
+	return []ghttp.Handler{
+		{
+			Method: http.MethodGet,
+			Path:   p,
+			Fn:     s.sharesGetRoute(),
+			Middleware: []ghttp.MiddlewareFn{
+				s.WithAuth(),
+			},
+		},
+		{
+			Method: http.MethodDelete,
+			Path:   p,
+			Fn:     s.sharesDelete(),
+			Middleware: []ghttp.MiddlewareFn{
+				s.WithAuth(),
+			},
+		},
+	}
+}
+
+func (s *server) sharesGetRoute() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		splitPath := getPath(r.URL.Path)
+		switch len(splitPath) {
+		case 1:
+			if splitPath[0] == sharePath {
+				s.sharesList()(w, r)
+				return
+			}
+		case 2:
+			if splitPath[0] == sharePath {
+				s.sharesGet()(w, r)
+				return
+			}
+		default:
+			http.Error(w, "not found", http.StatusNotFound)
+		}
+	}
+}
+```
+
+Having all the routes, I can create a `ghttp.Endpoints` object with them. I will set it as an `endpoints` method for server:
+
+```go
+func (s *server) endpoints() ghttp.Endpoints {
+	e := ghttp.NewEndpoints()
+	e.Set(s.usersHandler()...)
+	e.Set(s.secretsHandler()...)
+	e.Set(s.sharesHandler()...)
+	e.Set(s.sessionsHandler()...)
+	return e
+}
+```
+
+...And this method is used to configure a new `ghttp.Server`, since it takes a port and a `ghttp.Endpoints` object. So the `NewServer` function in this app will take in the port and the service, only:
+
+```go
+// NewServer creates a new HTTP server from the input port `port` and service `s`
+func NewServer(port int, s service.Service) Server {
+	srv := &server{s: s}
+	srv.HTTP = ghttp.NewServer(port, srv.endpoints())
+	return srv
+}
+```
+
+Let's take a look at `ghttp.NewServer`:
+
+```go
+const defaultPort = 8080
+
+type Server struct {
+	*http.Server
+}
+
+// NewServer spawns a default HTTP server on port `port`, configured with endpoints `endpoints`
+func NewServer(port int, endpoints Endpoints) *Server {
+	if port <= 0 {
+		port = defaultPort
+	}
+	mux := http.NewServeMux()
+	srv := &http.Server{
+		Addr: fmt.Sprintf(":%v", port),
+	}
+	return WithServerAndMux(srv, mux, endpoints)
+}
+
+// WithServerAndMux wraps existing *http.Server and a mux, with the input endpoints `endpoints`.
+// The input `mux` has to implement the HandleFunc(string, func(http.ResponseWriter, *http.Request))
+// method
+//
+// The input server `srv`'s Handler will be replaced with the input mux `mux`
+func WithServerAndMux(
+	srv *http.Server,
+	mux interface {
+		HandleFunc(string, func(http.ResponseWriter, *http.Request))
+	},
+	endpoints Endpoints,
+) *Server {
+	if srv == nil {
+		return WithMux(defaultPort, mux, endpoints)
+	}
+	if srv.Addr == "" {
+		srv.Addr = fmt.Sprintf(":%v", defaultPort)
+	}
+	for path, handlers := range endpoints {
+		r := NewRouter(handlers...)
+		mux.HandleFunc(path, r.ServeHTTP)
+	}
+	srv.Handler = mux.(http.Handler)
+
+	return &Server{srv}
+}
+```
+
+Since it's just using the standard library's `http.ServeMux`, all it's doing is configuring each path and handler in the `ghttp.Endpoints` as a `ghttp.router` which is configurable in the `http.ServeMux` as a `http.Handler`.
+
+#### Server interface
+
+To actually use the HTTP server, I need to be able to switch it on and off (at least). For this, I define a Server interface (what is returned from `NewServer`) with these methods:
+
+```go
+// Server describes the general actions the HTTP server will expose
+type Server interface {
+	// Start will initialize the HTTP server, returning an error. This is a blocking call.
+	Start(ctx context.Context) error
+	// Stop will gracefully shut-down the HTTP server, returning an error
+	Stop(ctx context.Context) error
+}
+```
+
+These can be used for any kind of server, not exclusively HTTP (it could be moved to transport at a later point).
+
+To implement this interface, I will use the `http.Server.ListenAndServe` and the `http.Server.Shutdown`	methods. Context is always present for observability, later:
+
+
+```go
+// Start will initialize the HTTP server, returning an error. This is a blocking call.
+func (s *server) Start(ctx context.Context) error {
+	return s.HTTP.ListenAndServe()
+}
+
+// Stop will gracefully shut-down the HTTP server, returning an error
+func (s *server) Stop(ctx context.Context) error {
+	return s.HTTP.Shutdown(ctx)
+}
+```
+
+HTTP is done! Oh wow!
+
 ___________
 
 ### Setting up factories
+
+The factory functions are entirely optional and I only include it in projects that make sense, namely those that use different backends and tech stacks for particular features (say, one of the app's options allows to pick different databases).
+
+These will still be implemented for the sake of documenting the process, and because it's a bit simpler to work with configuration and startup later.
+
+I will create a top-level directory on the project named `factory`:
+
+```
+.
+└─ factory
+    ├─ authz.go -- contains a function to initialize the authz.Authorizer
+    ├─ database.go -- contains functions to initialize the DB-based repositories
+    └─ factory.go -- contains functions to create the service and server
+```
+
 
 
 ___________
