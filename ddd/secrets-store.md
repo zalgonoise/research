@@ -2159,6 +2159,22 @@ func NewCipher(key []byte) EncryptDecrypter {
 }
 ```
 
+Lastly, to hash the users' passwords I want to use a secure method, so after testing a few combinations I've settled with 128-byte-long PBKDF2 keys over a SHA-512 hash function, with 600k iterations. In my machine this is about 1 second per password, which is a good amount of iterations for an OK-ish amount of time. SHA-3 was taking about 5~10 seconds per password for the same amount of iterations which is crazy.
+
+```go
+import (
+	"crypto/sha512"
+
+	"golang.org/x/crypto/pbkdf2"
+)
+
+const numHashIter = 600_001
+
+func Hash(secret, salt []byte) []byte {
+	return pbkdf2.Key(secret, salt, numHashIter, 128, sha512.New)
+}
+```
+
 This does it for the cryptography needs in this application, at least for the minimal viable product release.
 
 #### Authorization
@@ -2738,7 +2754,7 @@ For this the following is required:
 
 ```go
 	salt := crypt.NewSalt()
-	hashedPassword := sha256.Sum256(append([]byte(password), salt[:]...))
+	hashedPassword := crypt.Hash([]byte(password), salt[:])
 ```
 
 5. Base64-encoding both the salt and the password hash
@@ -2883,7 +2899,7 @@ func (s service) CreateUser(ctx context.Context, username, password, name string
 
 	// generate hash from password
 	salt := crypt.NewSalt()
-	hashedPassword := sha256.Sum256(append([]byte(password), salt[:]...))
+	hashedPassword := crypt.Hash([]byte(password), salt[:])
 
 	encSalt := base64.StdEncoding.EncodeToString(salt[:])
 	encHash := base64.StdEncoding.EncodeToString(hashedPassword[:])
@@ -4857,7 +4873,7 @@ To handle the credentials verification, I will add a separate `login` method tha
 2. Hash the input password with the salt appended to it
 
 ```go
-	hashedPassword := sha256.Sum256(append([]byte(password), salt...))
+	hashedPassword := crypt.Hash([]byte(password), salt[:])
 ```
 
 3. Compare this value with the stored hash. If it doesn't match it is an incorrect password
@@ -4881,7 +4897,7 @@ func (s service) login(ctx context.Context, u *user.User, password string) error
 	if err != nil {
 		return fmt.Errorf("failed to decode salt: %v", err)
 	}
-	hashedPassword := sha256.Sum256(append([]byte(password), salt...))
+	hashedPassword := crypt.Hash([]byte(password), salt)
 
 	if string(hashedPassword[:]) != string(hash) {
 		return ErrIncorrectPassword
@@ -5087,8 +5103,7 @@ This method updates a user's password. For this, I need to ensure the current cr
 5. Generate a hash of the new password with the user's salt appended to it 
 
 ```go
-	hashedPassword := sha256.Sum256(append([]byte(newPassword), salt...))
-	u.Hash = string(hashedPassword[:])
+	u.Hash = string(crypt.Hash([]byte(newPassword), salt))
 ```
 
 6. Update the user with the new hash value
@@ -5131,8 +5146,7 @@ func (s service) ChangePassword(ctx context.Context, username, password, newPass
 		return fmt.Errorf("failed to decode salt: %v", err)
 	}
 
-	hashedPassword := sha256.Sum256(append([]byte(newPassword), salt...))
-	u.Hash = string(hashedPassword[:])
+	u.Hash = string(crypt.Hash([]byte(newPassword), salt))
 
 	err = s.users.Update(ctx, username, u)
 	if err != nil {
