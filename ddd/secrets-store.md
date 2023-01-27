@@ -5434,6 +5434,254 @@ type server struct {
 
 From this point I can start desiging the actual handler funcs before even worrying about the endpoints structure.
 
+**`server.usersCreate`**
+
+This HandlerFunc will take care of POST requests against the `/users/` endpoint; which will call the `service.CreateUser` method. The `ParseFn` for this handler will read the request body to extract a username, name and password. I will use a private struct for this. The `ExecFn` will use this object to perform the `service.CreateUser` call:
+
+1. Starting with the struct describing a users create request; JSON tags included:
+
+```go
+func (s *server) usersCreate() http.HandlerFunc {
+	type usersCreateRequest struct {
+		Name     string `json:"name,omitempty"`
+		Username string `json:"username,omitempty"`
+		Password string `json:"password,omitempty"`
+	}
+	// (...)
+}
+```
+
+2. Then, extracting this data from the `*http.Request`:
+
+```go
+	var parseFn = func(ctx context.Context, r *http.Request) (*usersCreateRequest, error) {
+		return ghttp.ReadBody[usersCreateRequest](ctx, r)
+	}
+```
+
+The call to `ghttp.ReadBody` is a generic function in the `ghttp` package to unmarshal the request's body into an object of the input's kind. In this case, a `usersCreateRequest`. For context, this is what `ghttp.ReadBody[T any]` looks like:
+
+```go
+var (
+	// ErrInvalidBody is an error that is raised when reading the HTTP request body
+	ErrInvalidBody = errors.New("invalid body")
+	// ErrInvalidJSON is an error that is raised when parsing the HTTP request as JSON
+	ErrInvalidJSON = errors.New("body contains invalid JSON")
+)
+
+// ReadBody reads the data in the Body of *http.Request `r` as a bytes buffer,
+// and attempts to decode it into an object of type T by creating a new pointer of
+// this type and decoding the buffer into it
+//
+// Returns a pointer to the object T and an error
+func ReadBody[T any](ctx context.Context, r *http.Request) (*T, error) {
+	ctx, s := spanner.Start(ctx, "http.readBody")
+	defer s.End()
+	s.Add(attr.String("for_type", fmt.Sprintf("%T", *new(T))))
+
+	b, err := io.ReadAll(r.Body)
+	if err != nil {
+		s.Event("error reading body", attr.New("error", err.Error()))
+		return nil, fmt.Errorf("%w: %v", ErrInvalidBody, err)
+	}
+	item := new(T)
+	err = Enc(ctx).Decode(b, item)
+	if err != nil {
+		s.Event("error decoding buffer", attr.New("error", err.Error()), attr.String("buffer", string(b)))
+		return nil, fmt.Errorf("%w: %v", ErrInvalidJSON, err)
+	}
+	s.Event("decoded request body", attr.Ptr("item", item))
+	return item, nil
+}
+```
+
+The encoder call (`Enc(context.Context)`) will try to extract an existing JSON encoder from the input context (if configured), otherwise defaults to a [`goccy/go-json`](https://github.com/goccy/go-json) encoder; a fantastic (and fast) JSON package.
+
+
+3. Time to process the user's request. First, take a look at the `ExecFn` signature for this endpoint:
+
+```go
+var execFn = func(ctx context.Context, q *usersCreateRequest) *ghttp.Response[user.User] {}
+```
+
+What is `*ghttp.Response[T any]`? Great question. It'll (try to) simplify the approach to writing HTTP responses:
+
+```go
+// Responder writes an object to a http.ResponseWriter as a HTTP response
+type Responder interface {
+	// WriteHTTP writes the contents of the object to the http.ResponseWriter `w`
+	WriteHTTP(ctx context.Context, w http.ResponseWriter)
+}
+
+type Response[T any] struct {
+	Status  int               `json:"-"`
+	Message string            `json:"message,omitempty"`
+	Data    *T                `json:"data,omitempty"`
+	Headers map[string]string `json:"-"`
+}
+
+// NewResponse creates a generic HTTP response, initialized with a status and body message
+func NewResponse[T any](status int, msg string) *Response[T] {
+	return &Response[T]{
+		Status:  status,
+		Message: msg,
+		Headers: make(map[string]string),
+	}
+}
+```
+
+It also contains methods like `WithData(*T)` and `WithHeaders(map[string]string)` that allow chaining additional content into the response (for an inline return). The `Response[T any]` type supports an HTTP error approach just as well.
+
+4. To work on the `execFn`, it's important to validate the result of the `parseFn` (if the object is `nil`):
+
+```go
+	var execFn = func(ctx context.Context, q *usersCreateRequest) *ghttp.Response[user.User] {
+		if q == nil {
+			return ghttp.NewResponse[user.User](http.StatusBadRequest, "invalid request")
+		}
+	// (...)
+	}
+```
+
+5. Then, just push it to the service! If there are any issues with the actual input (empty values, invalid ones), it will be returned as an error. These errors will be checked on to return the appropriate HTTP code and message. If all goes well, return a 200 status code and the user object. The user object (`user.User`) already contains the JSON tags necessary to also hide the hash and salt values:
+
+```go
+	var execFn = func(ctx context.Context, q *usersCreateRequest) *ghttp.Response[user.User] {
+	// (...)
+		dbuser, err := s.s.CreateUser(ctx, q.Username, q.Password, q.Name)
+		if err != nil {
+			if errors.Is(service.ErrAlreadyExistsUser, err) {
+				return ghttp.NewResponse[user.User](http.StatusConflict, err.Error())
+			}
+			return ghttp.NewResponse[user.User](http.StatusInternalServerError, err.Error())
+		}
+		return ghttp.NewResponse[user.User](http.StatusOK, "user created successfully").WithData(dbuser)
+	// (...)
+	}
+```
+
+6. With both `parseFn` and `execFn` ready, just return a `ghttp.Do` call: 
+
+```go
+	return ghttp.Do("UsersCreate", parseFn, execFn)
+```
+
+And that's it for this `HandlerFunc`! Here is the entire thing:
+
+```go
+func (s *server) usersCreate() http.HandlerFunc {
+	type usersCreateRequest struct {
+		Name     string `json:"name,omitempty"`
+		Username string `json:"username,omitempty"`
+		Password string `json:"password,omitempty"`
+	}
+	var parseFn = func(ctx context.Context, r *http.Request) (*usersCreateRequest, error) {
+		return ghttp.ReadBody[usersCreateRequest](ctx, r)
+	}
+
+	var execFn = func(ctx context.Context, q *usersCreateRequest) *ghttp.Response[user.User] {
+		if q == nil {
+			return ghttp.NewResponse[user.User](http.StatusBadRequest, "invalid request")
+		}
+
+		dbuser, err := s.s.CreateUser(ctx, q.Username, q.Password, q.Name)
+		if err != nil {
+			if errors.Is(service.ErrAlreadyExistsUser, err) {
+				return ghttp.NewResponse[user.User](http.StatusConflict, err.Error())
+			}
+			return ghttp.NewResponse[user.User](http.StatusInternalServerError, err.Error())
+		}
+		return ghttp.NewResponse[user.User](http.StatusOK, "user created successfully").WithData(dbuser)
+	}
+
+	return ghttp.Do("UsersCreate", parseFn, execFn)
+}
+```
+
+
+**`server.usersGet`**
+
+While `usersCreate` does not require authentication, this endpoint will -- but since I am still sketching out the `HandlerFunc`s I can disregard that for now and treat all endpoints as *post-auth* when applicable (or, thinking that this will be reachable only by authorized users).
+
+When fetching a specific user, users will call `GET /users/username`. Since the service also just cares about the username parameter, I will extract it from the URL path in the `*http.Request`. This was one of the reasons why the `ghttp.ParseFn` accepts the entire `*http.Request` object and not just the body or something else. We could check on headers, path, user-agent, etc.
+
+1. Starting with the `ParseFn`; it will get the username from the URL path, by trimming the `/users/` part of the path -- returning an error if the remainder is an empty string:
+
+```go
+	var parseFn = func(ctx context.Context, r *http.Request) (*string, error) {
+		prefix := "/users/"
+		q := r.URL.Path[len(prefix):]
+
+		if q == "" {
+			return nil, errors.New("no username provided")
+		}
+
+		return &q, nil
+	}
+```
+
+2. The `ExecFn` will evaluate if the username in the request is nil or empty, and perform a `service.GetUser` call with that username. Again, validation is done on the service layer. The returned HTTP responses can be for a 404 (not found), or a 500 for other errors. Otherwise the response will be an OK response (200) with the user object attached.
+
+```go
+	var execFn = func(ctx context.Context, q *string) *ghttp.Response[user.User] {
+		if q == nil || *q == "" {
+			return ghttp.NewResponse[user.User](http.StatusBadRequest, "invalid username")
+		}
+
+		dbuser, err := s.s.GetUser(ctx, *q)
+		if err != nil {
+			if errors.Is(sqlite.ErrNotFoundUser, err) {
+				return ghttp.NewResponse[user.User](http.StatusNotFound, err.Error())
+			}
+			return ghttp.NewResponse[user.User](http.StatusInternalServerError, err.Error())
+		}
+
+		return ghttp.NewResponse[user.User](http.StatusOK, "user fetched successfully").WithData(dbuser)
+	}
+```
+
+3. Lastly, simply return a `ghttp.Do` call with the above functions:
+
+```go
+	return ghttp.Do("UsersGet", parseFn, execFn)
+```
+
+Here's the entire thing:
+
+
+```go
+func (s *server) usersGet() http.HandlerFunc {
+	var parseFn = func(ctx context.Context, r *http.Request) (*string, error) {
+		prefix := "/users/"
+		q := r.URL.Path[len(prefix):]
+
+		if q == "" {
+			return nil, errors.New("no username provided")
+		}
+
+		return &q, nil
+	}
+
+	var execFn = func(ctx context.Context, q *string) *ghttp.Response[user.User] {
+		if q == nil || *q == "" {
+			return ghttp.NewResponse[user.User](http.StatusBadRequest, "invalid username")
+		}
+
+		dbuser, err := s.s.GetUser(ctx, *q)
+		if err != nil {
+			if errors.Is(sqlite.ErrNotFoundUser, err) {
+				return ghttp.NewResponse[user.User](http.StatusNotFound, err.Error())
+			}
+			return ghttp.NewResponse[user.User](http.StatusInternalServerError, err.Error())
+		}
+
+		return ghttp.NewResponse[user.User](http.StatusOK, "user fetched successfully").WithData(dbuser)
+	}
+
+	return ghttp.Do("UsersGet", parseFn, execFn)
+}
+```
+
 
 #### Handling endpoints that require auth
 ___________
