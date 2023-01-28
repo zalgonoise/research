@@ -5397,12 +5397,21 @@ func Do[Q any, A any](name string, parseFn ParseFn[Q], queryFn ExecFn[Q, A]) htt
 		if parseFn != nil {
 			query, err = parseFn(ctx, r)
 			if err != nil {
+				s.Event("failed to parse the request", attr.String("error", err.Error()))
 				NewResponse[A](http.StatusBadRequest, err.Error()).WriteHTTP(ctx, w)
 				return
 			}
 		}
 
-		queryFn(ctx, query).WriteHTTP(ctx, w)
+		res := queryFn(ctx, query)
+		if res.Status > 399 {
+			s.Event("operation error", attr.Int("status", res.Status), attr.String("error", res.Message))
+			res.WriteHTTP(ctx, w)
+			return
+		}
+
+		s.Event("operation successful", attr.Int("status", res.Status))
+		res.WriteHTTP(ctx, w)
 	}
 }
 ```
@@ -8372,11 +8381,10 @@ Starting with the existing `ExecFn` for `server.usersUpdate`:
 	}
 ```
 
-2. Next, I will register if the object is nil, as the reason for the end of the span, as an event. If it's not, I set (**non-PII**) attributes to the span, in the context of this request (in this case, username and new name):
+2. Next, I will register meaningful attributes if the object is not nil (in this case, username and new name):
 
 ```go
 		if q == nil {
-			span.Event("operation error", attr.String("error", "invalid request"))
 			return ghttp.NewResponse[user.User](http.StatusBadRequest, "invalid request")
 		}
 		span.Add(
@@ -8385,28 +8393,7 @@ Starting with the existing `ExecFn` for `server.usersUpdate`:
 		)
 ```
 
-3. As for the service calls, I will add a span event in case it raises an error:
-
-```go
-		err := s.s.UpdateUser(ctx, q.Username, u)
-		if err != nil {
-			span.Event("operation error", attr.String("error", err.Error()))
-			return ghttp.NewResponse[user.User](http.StatusInternalServerError, err.Error())
-		}
-
-		dbUser, err := s.s.GetUser(ctx, q.Username)
-		if err != nil {
-			span.Event("operation error", attr.String("error", err.Error()))
-			return ghttp.NewResponse[user.User](http.StatusInternalServerError, err.Error())
-		}
-```
-
-4. Lastly, I add a "operation successful" event if it's a 200 response: 
-
-```go
-		span.Event("operation successful", attr.New("user", dbUser))
-		return ghttp.NewResponse[user.User](http.StatusOK, "user updated successfully").WithData(dbUser)
-```
+3. As for the service calls, any errors will result in a status code above 399, which will trigger `ghttp.Do` to register an appropriate event with the error message in the Response. So this will do.
 
 This pattern will be seen in all HTTP endpoints.
 ___________
