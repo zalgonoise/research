@@ -5809,7 +5809,7 @@ For the update action, a couple of checks need to take place. Consider that the 
 	}
 ```
 
-4. The `ExecFn` verifies that the object is not nil; and issues the `service.UpdateUser` call.
+4. The `ExecFn` verifies that the object is not nil; and issues the `service.UpdateUser` call. Then issues a `GetUser` call to return the new version of the user to the caller:
 
 ```go
 	var execFn = func(ctx context.Context, q *usersUpdateRequest) *ghttp.Response[user.User] {
@@ -5826,7 +5826,12 @@ For the update action, a couple of checks need to take place. Consider that the 
 			return ghttp.NewResponse[user.User](http.StatusInternalServerError, err.Error())
 		}
 
-		return ghttp.NewResponse[user.User](http.StatusOK, "user updated successfully").WithData(u)
+		dbUser, err := s.s.GetUser(ctx, q.Username)
+		if err != nil {
+			return ghttp.NewResponse[user.User](http.StatusInternalServerError, err.Error())
+		}
+
+		return ghttp.NewResponse[user.User](http.StatusOK, "user updated successfully").WithData(dbUser)
 	}
 ```
 
@@ -8325,6 +8330,85 @@ This means that all calls to `ghttp.Do` were already passing in a service name t
 
 Now, it is important to go through each HandlerFunc and understanding what should be instrumented and where. Since this goes on top of the http logic, I will want to reduce the added LOC to the least possible.
 
+Let me use `server.usersUpdate` as an example since it contains a convoluted `ParseFn` and `ExecFn`.
+
+It's not necessary to add tracing to the `ParseFn` since it's taken care of by `ghttp.Do`, since it is returning an error already.
+
+The `ExecFn` will have instrumentation to identify (some) of the added parameters, errors, and successful requests if it's the case.
+
+Starting with the existing `ExecFn` for `server.usersUpdate`:
+
+```go
+	var execFn = func(ctx context.Context, q *usersUpdateRequest) *ghttp.Response[user.User] {
+		if q == nil {
+			return ghttp.NewResponse[user.User](http.StatusBadRequest, "invalid request")
+		}
+
+		u := &user.User{
+			Username: q.Username,
+		}
+
+		err := s.s.UpdateUser(ctx, q.Username, u)
+		if err != nil {
+			return ghttp.NewResponse[user.User](http.StatusInternalServerError, err.Error())
+		}
+
+		dbUser, err := s.s.GetUser(ctx, q.Username)
+		if err != nil {
+			return ghttp.NewResponse[user.User](http.StatusInternalServerError, err.Error())
+		}
+
+		return ghttp.NewResponse[user.User](http.StatusOK, "user updated successfully").WithData(dbUser)
+	}
+```
+
+1. I will start with a new span, specific to the exec function (there is already a span for this call as `UpdateUser`):
+
+```go
+	var execFn = func(ctx context.Context, q *usersUpdateRequest) *ghttp.Response[user.User] {
+		ctx, span := spanner.Start(ctx, "http.UpdateUser:exec")
+		defer span.End()
+	// (...)
+	}
+```
+
+2. Next, I will register if the object is nil, as the reason for the end of the span, as an event. If it's not, I set (**non-PII**) attributes to the span, in the context of this request (in this case, username and new name):
+
+```go
+		if q == nil {
+			span.Event("operation error", attr.String("error", "invalid request"))
+			return ghttp.NewResponse[user.User](http.StatusBadRequest, "invalid request")
+		}
+		span.Add(
+			attr.String("for_user", q.Username),
+			attr.String("new_name", q.Name),
+		)
+```
+
+3. As for the service calls, I will add a span event in case it raises an error:
+
+```go
+		err := s.s.UpdateUser(ctx, q.Username, u)
+		if err != nil {
+			span.Event("operation error", attr.String("error", err.Error()))
+			return ghttp.NewResponse[user.User](http.StatusInternalServerError, err.Error())
+		}
+
+		dbUser, err := s.s.GetUser(ctx, q.Username)
+		if err != nil {
+			span.Event("operation error", attr.String("error", err.Error()))
+			return ghttp.NewResponse[user.User](http.StatusInternalServerError, err.Error())
+		}
+```
+
+4. Lastly, I add a "operation successful" event if it's a 200 response: 
+
+```go
+		span.Event("operation successful", attr.New("user", dbUser))
+		return ghttp.NewResponse[user.User](http.StatusOK, "user updated successfully").WithData(dbUser)
+```
+
+This pattern will be seen in all HTTP endpoints.
 ___________
 
 ### Wrapping up
