@@ -8396,9 +8396,183 @@ Starting with the existing `ExecFn` for `server.usersUpdate`:
 3. As for the service calls, any errors will result in a status code above 399, which will trigger `ghttp.Do` to register an appropriate event with the error message in the Response. So this will do.
 
 This pattern will be seen in all HTTP endpoints.
+
+Peeking into a trace file after a login event, I can extract a good amount of metadata without breaking confidentiality in any way. Here is the trace collected for a user's login event:
+
+```json
+{
+  "name": "http.readBody",
+  "context": {
+    "trace_id": "dc7298d52f5e2b076e0ae15ef57c2068",
+    "span_id": "b71e6bddb80be89a"
+  },
+  "parent_id": "98e1532617a5ed5e",
+  "start_time": "2023-01-28T18:11:51.19229419+01:00",
+  "end_time": "2023-01-28T18:11:51.192398266+01:00",
+  "attributes": {
+    "for_type": "http.loginRequest"
+  }
+}
+{
+  "name": "user.Get",
+  "context": {
+    "trace_id": "dc7298d52f5e2b076e0ae15ef57c2068",
+    "span_id": "87e44f9c5bb2c87c"
+  },
+  "parent_id": "d2dcfb08082d8acc",
+  "start_time": "2023-01-28T18:11:51.192433463+01:00",
+  "end_time": "2023-01-28T18:11:51.192718701+01:00",
+  "attributes": {
+    "username": "zalgo"
+  }
+}
+{
+  "name": "authz.NewToken",
+  "context": {
+    "trace_id": "dc7298d52f5e2b076e0ae15ef57c2068",
+    "span_id": "4c1740c775ba71e3"
+  },
+  "parent_id": "d2dcfb08082d8acc",
+  "start_time": "2023-01-28T18:11:52.144512065+01:00",
+  "end_time": "2023-01-28T18:11:52.144639025+01:00",
+  "attributes": {
+    "username": "zalgo"
+  }
+}
+{
+  "name": "keys.Set",
+  "context": {
+    "trace_id": "dc7298d52f5e2b076e0ae15ef57c2068",
+    "span_id": "b7fab38da61c4977"
+  },
+  "parent_id": "d2dcfb08082d8acc",
+  "start_time": "2023-01-28T18:11:52.144647912+01:00",
+  "end_time": "2023-01-28T18:11:52.144692596+01:00",
+  "attributes": {
+    "in_bucket": "uid:1"
+  }
+}
+{
+  "name": "service.Login",
+  "context": {
+    "trace_id": "dc7298d52f5e2b076e0ae15ef57c2068",
+    "span_id": "d2dcfb08082d8acc"
+  },
+  "parent_id": "f6ed9705ebddba03",
+  "start_time": "2023-01-28T18:11:51.192407814+01:00",
+  "end_time": "2023-01-28T18:11:52.144698317+01:00",
+  "attributes": {
+    "username": "zalgo"
+  }
+}
+{
+  "name": "http.Login:exec",
+  "context": {
+    "trace_id": "dc7298d52f5e2b076e0ae15ef57c2068",
+    "span_id": "f6ed9705ebddba03"
+  },
+  "parent_id": "98e1532617a5ed5e",
+  "start_time": "2023-01-28T18:11:51.192404598+01:00",
+  "end_time": "2023-01-28T18:11:52.1447001+01:00",
+  "attributes": {
+    "for_user": "zalgo"
+  }
+}
+{
+  "name": "http.HttpResponse.WriteHTTP",
+  "context": {
+    "trace_id": "dc7298d52f5e2b076e0ae15ef57c2068",
+    "span_id": "b10d3ffedf31c9a0"
+  },
+  "parent_id": "98e1532617a5ed5e",
+  "start_time": "2023-01-28T18:11:52.144703076+01:00",
+  "end_time": "2023-01-28T18:11:52.144836177+01:00",
+  "attributes": {
+    "for_type": "user.Session",
+    "http_status": 200
+  }
+}
+{
+  "name": "Login",
+  "context": {
+    "trace_id": "dc7298d52f5e2b076e0ae15ef57c2068",
+    "span_id": "98e1532617a5ed5e"
+  },
+  "parent_id": null,
+  "start_time": "2023-01-28T18:11:51.192282157+01:00",
+  "end_time": "2023-01-28T18:11:52.14483802+01:00",
+  "attributes": {
+    "req": {
+      "module": "Login",
+      "remote_addr": "127.0.0.1:40586",
+      "req_id": "87bf64f3-1c53-404a-a132-328591a6295c",
+      "user_agent": "curl/7.87.0"
+    }
+  }
+}
+```
+
+This was the original HTTP request and response:
+
+```
+curl -v -X POST 127.0.0.1:8080/login -d '{"username":"zalgo","password":"secretpassword"}'  
+Note: Unnecessary use of -X or --request, POST is already inferred.
+*   Trying 127.0.0.1:8080...
+* Connected to 127.0.0.1 (127.0.0.1) port 8080 (#0)
+> POST /login HTTP/1.1
+> Host: 127.0.0.1:8080
+> User-Agent: curl/7.87.0
+> Accept: */*
+> Content-Length: 42
+> Content-Type: application/x-www-form-urlencoded
+> 
+* Mark bundle as not supporting multiuse
+< HTTP/1.1 200 OK
+< Date: Sat, 28 Jan 2023 17:11:52 GMT
+< Content-Length: 443
+< Content-Type: text/plain; charset=utf-8
+< 
+```
+
+```json
+{
+  "message": "user logged in successfully",
+  "data": {
+    "user": {
+      "id": 1,
+      "username": "zalgo",
+      "name": "Zalgo",
+      "created_at": "2023-01-28T17:11:47Z",
+      "updated_at": "2023-01-28T17:11:47Z"
+    },
+    "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE2NzQ5Mjk1MTIsInVzZXIiOnsidXNlcm5hbWUiOiJ6YWxnbyIsIm5hbWUiOiJaYWxnbyIsImNyZWF0ZWRfYXQiOiIyMDIzLTAxLTI4VDE3OjExOjQ3WiIsInVwZGF0ZWRfYXQiOiIyMDIzLTAxLTI4VDE3OjExOjQ3WiJ9fQ.z-8MgM5HX63PFr91AF7KMChuCOTtcsyspqQfHweEJ-4"
+  }
+}
+```
+
+Decoded JWT's payload:
+
+```json
+{
+  "exp": 1674929512,
+  "user": {
+    "username": "zalgo",
+    "name": "Zalgo",
+    "created_at": "2023-01-28T17:11:47Z",
+    "updated_at": "2023-01-28T17:11:47Z"
+  }
+}
+```
+
 ___________
 
 ### Wrapping up
+
+Fantastic, we have a Go app ready to be built, and the resulting binary is compatible with whichever system it targets (most of them at least).
+
+Taking it up a notch, it would be good to deploy it as a Docker container so that it's easy for any user to run an instance, with or without persistence, and as a manageable service.
+
+I will create a `Dockerfile` at the root of the project to create the container:
 
 
 ___________
