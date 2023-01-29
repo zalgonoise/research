@@ -27,6 +27,28 @@ The entities in this model are simple, there are users who create secrets, and t
 
 Of course, the app will have a few other services to support authentication, authorization and encryption, for example. But these services are not the core-purpose of the app.
 
+### Error handling
+This app will work with several errors, sometimes with multiple errors wrapped together (a general database error and the actual error raised).
+
+Since as of now (Go v1.19) the standard library does not support wrapping multiple errors together, the statement below **is not** possible:
+
+```go
+err := fmt.Errorf("errors: %w -- %w", err1, err2)
+```
+
+However, with Go 1.20, the `errors` package is greatly improved with joined errors.
+
+I am eager to use this feature. So much that I externalized in in my [`zalgonoise/x/errors`](https://github.com/zalgonoise/x/tree/master/errors) package. This is an exact replica of [Go 1.20's `errors`](https://github.com/golang/go/tree/master/src/errors), with `reflectlite` replaced with regular `reflect`.
+
+This allows me to join errors together like the statement below (and still having `errors.Is` verify if the nested error is included or not):
+
+
+```go
+err := errors.Join(err1, err2)
+```
+
+As such, you will find in this repo both references to `fmt.Errorf("blablabla: %w", err)` and `errors.Join(ErrSomething, err)`.
+
 ### Entities
 
 Like the diagram above implies, at least two entities are necessary: User and Secret.
@@ -588,7 +610,7 @@ func (ukr *keysRepository) Get(ctx context.Context, bucket, k string) ([]byte, e
 		if errors.Is(err, ErrEmptyBucket) {
 			return nil, err
 		}
-		return nil, fmt.Errorf("%w: %v", ErrDBError, err)
+		return nil, errors.Join(ErrDBError, err)
 	}
 
 	return v, nil
@@ -618,18 +640,18 @@ func (ukr *keysRepository) Set(ctx context.Context, bucket, k string, v []byte) 
 	err := ukr.db.Update(func(tx *bbolt.Tx) error {
 		b, err := tx.CreateBucketIfNotExists([]byte(bucket))
 		if err != nil {
-			return fmt.Errorf("failed to get / create bucket: %v", err)
+			return fmt.Errorf("failed to get / create bucket: %w", err)
 		}
 
 		err = b.Put([]byte(k), []byte(v))
 		if err != nil {
-			return fmt.Errorf("failed to set key-value: %v", err)
+			return fmt.Errorf("failed to set key-value: %w", err)
 		}
 
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrDBError, err)
+		return errors.Join(ErrDBError, err)
 	}
 	return nil
 }
@@ -659,7 +681,7 @@ func (ukr *keysRepository) Delete(ctx context.Context, bucket, k string) error {
 
 		err := b.Delete([]byte(k))
 		if err != nil {
-			return fmt.Errorf("failed to delete key %s in the bucket %s: %v", k, bucket, err)
+			return fmt.Errorf("failed to delete key %s in the bucket %s: %w", k, bucket, err)
 		}
 		return nil
 	})
@@ -668,7 +690,7 @@ func (ukr *keysRepository) Delete(ctx context.Context, bucket, k string) error {
 		if errors.Is(err, ErrEmptyBucket) {
 			return err
 		}
-		return fmt.Errorf("%w: %v", ErrDBError, err)
+		return errors.Join(ErrDBError, err)
 	}
 	return nil
 }
@@ -686,13 +708,13 @@ func (ukr *keysRepository) Purge(ctx context.Context, bucket string) error {
 	err := ukr.db.Update(func(tx *bbolt.Tx) error {
 		err := tx.DeleteBucket([]byte(bucket))
 		if err != nil {
-			return fmt.Errorf("failed to delete the bucket %s: %v", bucket, err)
+			return fmt.Errorf("failed to delete the bucket %s: %w", bucket, err)
 		}
 		return nil
 	})
 
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrDBError, err)
+		return errors.Join(ErrDBError, err)
 	}
 	return nil
 }
@@ -705,9 +727,9 @@ Since the methods refer some error types that seem to be part of this package, t
 ```go
 import (
 	"context"
-	"errors"
 	"fmt"
 
+	"github.com/zalgonoise/x/errors"
 	"github.com/zalgonoise/x/secr/keys"
 	"go.etcd.io/bbolt"
 )
@@ -931,7 +953,7 @@ import (
 func IsUserFound(res sql.Result) error {
 	n, err := res.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrDBError, err)
+		return errors.Join(ErrDBError, err)
 	}
 	if n == 0 {
 		return ErrNotFoundUser
@@ -943,7 +965,7 @@ func IsUserFound(res sql.Result) error {
 func IsSecretFound(res sql.Result) error {
 	n, err := res.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrDBError, err)
+		return errors.Join(ErrDBError, err)
 	}
 	if n == 0 {
 		return ErrNotFoundSecret
@@ -955,7 +977,7 @@ func IsSecretFound(res sql.Result) error {
 func IsShareFound(res sql.Result) error {
 	n, err := res.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrDBError, err)
+		return errors.Join(ErrDBError, err)
 	}
 	if n == 0 {
 		return ErrNotFoundShare
@@ -1075,12 +1097,12 @@ VALUES (?, ?, ?, ?)
 `, dbu.Username, dbu.Name, dbu.Hash, dbu.Salt)
 
 	if err != nil {
-		return 0, fmt.Errorf("%w: failed to create user %s: %v", ErrDBError, u.Username, err)
+		return 0, errors.Join(ErrDBError, fmt.Errorf("failed to create user %s: %w",u.Username, err))
 	}
 
 	id, err := res.LastInsertId()
 	if err != nil {
-		return 0, fmt.Errorf("%w: failed to create user %s: %v", ErrDBError, u.Username, err)
+		return 0, errors.Join(ErrDBError, fmt.Errorf("failed to create user %s: %w", u.Username, err))
 	}
 	if id == 0 {
 		return 0, fmt.Errorf("%w: user was not created %s", ErrDBError, u.Username)
@@ -1138,7 +1160,7 @@ func (ur *userRepository) scanUser(r Scanner) (u *user.User, err error) {
 		if errors.Is(sql.ErrNoRows, err) {
 			return nil, ErrNotFoundUser
 		}
-		return nil, fmt.Errorf("%w: failed to scan DB row: %v", ErrDBError, err)
+		return nil, errors.Join(ErrDBError, fmt.Errorf("failed to scan DB row: %w", err))
 	}
 	return dbu.toDomainEntity(), nil
 }
@@ -1162,12 +1184,12 @@ SELECT u.id, u.username, u.name, u.created_at, u.updated_at
 FROM users AS u
 	`)
 	if err != nil {
-		return nil, fmt.Errorf("%w: failed to list users: %v", ErrDBError, err)
+		return nil, errors.Join(ErrDBError, fmt.Errorf("failed to list users: %w", err))
 	}
 
 	users, err := ur.scanUsers(rows)
 	if err != nil {
-		return nil, fmt.Errorf("%w: failed to list users: %v", ErrDBError, err)
+		return nil, errors.Join(ErrDBError, fmt.Errorf("failed to list users: %w", err))
 	}
 	return users, nil
 }
@@ -1182,7 +1204,7 @@ func (ur *userRepository) scanUsers(rs *sql.Rows) ([]*user.User, error) {
 	for rs.Next() {
 		u, err := ur.scanUser(rs)
 		if err != nil {
-			return nil, fmt.Errorf("failed to scan row: %v", err)
+			return nil, fmt.Errorf("failed to scan row: %w", err)
 		}
 		users = append(users, u)
 	}
@@ -1213,7 +1235,7 @@ WHERE u.username = ?
 `, dbu.Name, dbu.Hash, ToSQLString(username))
 
 	if err != nil {
-		return fmt.Errorf("%w: failed to update user %s: %v", ErrDBError, username, err)
+		return errors.Join(ErrDBError, fmt.Errorf("failed to update user %s: %w", username, err))
 	}
 
 	err = IsUserFound(res)
@@ -1236,7 +1258,7 @@ func (ur *userRepository) Delete(ctx context.Context, username string) error {
 	`, ToSQLString(username))
 
 	if err != nil {
-		return fmt.Errorf("%w: failed to delete user %s: %v", ErrDBError, username, err)
+		return errors.Join(ErrDBError, fmt.Errorf("failed to delete user %s: %w", username, err))
 	}
 
 	err = IsUserFound(res)
@@ -1255,9 +1277,9 @@ func (ur *userRepository) Delete(ctx context.Context, username string) error {
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 
+	"github.com/zalgonoise/x/errors"
 	"github.com/zalgonoise/x/secr/user"
 )
 
@@ -1357,7 +1379,7 @@ func (sr *secretRepository) scanSecret(r Scanner) (s *secret.Secret, err error) 
 		if errors.Is(sql.ErrNoRows, err) {
 			return nil, ErrNotFoundSecret
 		}
-		return nil, fmt.Errorf("%w: failed to scan DB row: %v", ErrDBError, err)
+		return nil, errors.Join(ErrDBError, fmt.Errorf("failed to scan DB row: %w", err))
 	}
 	return dbs.toDomainEntity(), nil
 }
@@ -1369,7 +1391,7 @@ func (sr *secretRepository) scanSecrets(rs *sql.Rows) ([]*secret.Secret, error) 
 	for rs.Next() {
 		s, err := sr.scanSecret(rs)
 		if err != nil {
-			return nil, fmt.Errorf("failed to scan row: %v", err)
+			return nil, fmt.Errorf("failed to scan row: %w", err)
 		}
 		secrets = append(secrets, s)
 	}
@@ -1395,15 +1417,15 @@ VALUES (
 `, ToSQLString(username), dbs.Name)
 
 	if err != nil {
-		return 0, fmt.Errorf("%w: failed to create secret %s: %v", ErrDBError, s.Key, err)
+		return 0, errors.Join(ErrDBError, fmt.Errorf("failed to create secret %s: %w", s.Key, err))
 	}
 
 	id, err := res.LastInsertId()
 	if err != nil {
-		return 0, fmt.Errorf("%w: failed to create secret %s: %v", ErrDBError, s.Key, err)
+		return 0, errors.Join(ErrDBError, fmt.Errorf("failed to create secret %s: %w",  s.Key, err))
 	}
 	if id == 0 {
-		return 0, fmt.Errorf("%w: secret was not created %s", ErrDBError, s.Key)
+		return 0, fmt.Errorf("secret was not created %s", ErrDBError, s.Key)
 	}
 
 	return uint64(id), nil
@@ -1450,12 +1472,12 @@ WHERE u.username = ?
 		`, ToSQLString(username))
 
 	if err != nil {
-		return nil, fmt.Errorf("%w: failed to list secrets: %v", ErrDBError, err)
+		return nil, errors.Join(ErrDBError, fmt.Errorf("failed to list secrets: %w", err))
 	}
 
 	secrets, err := sr.scanSecrets(rows)
 	if err != nil {
-		return nil, fmt.Errorf("%w: failed to list secrets: %v", ErrDBError, err)
+		return nil, errors.Join(ErrDBError, fmt.Errorf("failed to list secrets: %w", err))
 	}
 
 	return secrets, nil
@@ -1479,7 +1501,7 @@ func (sr *secretRepository) Delete(ctx context.Context, username string, key str
 	`, ToSQLString(username), ToSQLString(key))
 
 	if err != nil {
-		return fmt.Errorf("%w: failed to delete secret %s: %v", ErrDBError, key, err)
+		return errors.Join(ErrDBError, fmt.Errorf("failed to delete secret %s: %w", key, err))
 	}
 
 	err = IsSecretFound(res)
@@ -1498,9 +1520,9 @@ func (sr *secretRepository) Delete(ctx context.Context, username string, key str
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 
+	"github.com/zalgonoise/x/errors"
 	"github.com/zalgonoise/x/secr/secret"
 )
 
@@ -1525,9 +1547,9 @@ package sqlite
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 
+	"github.com/zalgonoise/x/errors"
 	"github.com/zalgonoise/x/secr/shared"
 )
 
@@ -1696,7 +1718,7 @@ func (sr *sharedRepository) scanShare(r Scanner) (dbs *dbShare, err error) {
 		if errors.Is(sql.ErrNoRows, err) {
 			return nil, ErrNotFoundShare
 		}
-		return nil, fmt.Errorf("%w: failed to scan DB row: %v", ErrDBError, err)
+		return nil, errors.Join(ErrDBError, fmt.Errorf("failed to scan DB row: %w", err))
 	}
 	return dbs, nil
 }
@@ -1708,7 +1730,7 @@ func (sr *sharedRepository) scanShares(rs *sql.Rows) ([]*shared.Share, error) {
 	for rs.Next() {
 		dbs, err := sr.scanShare(rs)
 		if err != nil {
-			return nil, fmt.Errorf("failed to scan row: %v", err)
+			return nil, fmt.Errorf("failed to scan row: %w", err)
 		}
 		shares = append(shares, dbs)
 	}
@@ -1734,7 +1756,7 @@ func (sr *sharedRepository) Create(ctx context.Context, sh *shared.Share) (uint6
 	shares := newDBShare(sh)
 	tx, err := sr.db.Begin()
 	if err != nil {
-		return 0, fmt.Errorf("failed to begin transaction: %v", err)
+		return 0, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 
 	defer tx.Rollback()
@@ -1764,7 +1786,7 @@ func (sr *sharedRepository) Create(ctx context.Context, sh *shared.Share) (uint6
 
 	err = tx.Commit()
 	if err != nil {
-		return 0, fmt.Errorf("failed to create shared secret: %v", err)
+		return 0, fmt.Errorf("failed to create shared secret: %w", err)
 	}
 	return lastID, nil
 }
@@ -1791,12 +1813,12 @@ WHERE o.username = ?
 `, ToSQLString(username), ToSQLString(secretName))
 
 	if err != nil {
-		return nil, fmt.Errorf("%w: failed to list shared secrets: %v", ErrDBError, err)
+		return nil, errors.Join(ErrDBError, fmt.Errorf("failed to list shared secrets: %w", err))
 	}
 
 	shares, err := sr.scanShares(rows)
 	if err != nil {
-		return nil, fmt.Errorf("%w: failed to list shared secrets: %v", ErrDBError, err)
+		return nil, errors.Join(ErrDBError, fmt.Errorf("failed to list shared secrets: %w", err))
 	}
 	return shares, nil
 }
@@ -1819,12 +1841,12 @@ WHERE o.username = ?
 `, ToSQLString(username))
 
 	if err != nil {
-		return nil, fmt.Errorf("%w: failed to list shared secrets: %v", ErrDBError, err)
+		return nil, errors.Join(ErrDBError, fmt.Errorf("failed to list shared secrets: %w", err))
 	}
 
 	shares, err := sr.scanShares(rows)
 	if err != nil {
-		return nil, fmt.Errorf("%w: failed to list shared secrets: %v", ErrDBError, err)
+		return nil, errors.Join(ErrDBError, fmt.Errorf("failed to list shared secrets: %w", err))
 	}
 	return shares, nil
 }
@@ -1849,12 +1871,12 @@ func (sr *sharedRepository) ListTarget(ctx context.Context, target string) ([]*s
 	`, ToSQLString(target))
 
 	if err != nil {
-		return nil, fmt.Errorf("%w: failed to list shared secrets: %v", ErrDBError, err)
+		return nil, errors.Join(ErrDBError, fmt.Errorf("failed to list shared secrets: %w", err))
 	}
 
 	shares, err := sr.scanShares(rows)
 	if err != nil {
-		return nil, fmt.Errorf("%w: failed to list shared secrets: %v", ErrDBError, err)
+		return nil, errors.Join(ErrDBError, fmt.Errorf("failed to list shared secrets: %w", err))
 	}
 	return shares, nil
 }
@@ -1873,7 +1895,7 @@ func (sr *sharedRepository) Delete(ctx context.Context, sh *shared.Share) error 
 	dbs := newDBShare(sh)
 	tx, err := sr.db.Begin()
 	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %v", err)
+		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 
 	// defer rollback in case an error occurs
@@ -1893,7 +1915,7 @@ WHERE o.username = ?
 			share.Owner, share.Secret, share.Target)
 
 		if err != nil {
-			return fmt.Errorf("%w: %v", ErrDBError, err)
+			return errors.Join(ErrDBError, err)
 		}
 		err = IsShareFound(res)
 		if err != nil {
@@ -1903,7 +1925,7 @@ WHERE o.username = ?
 
 	err = tx.Commit()
 	if err != nil {
-		return fmt.Errorf("%w: shared secret was not deleted: %v", ErrDBError, err)
+		return errors.Join(ErrDBError, fmt.Errorf("shared secret was not deleted: %w", err))
 	}
 	return nil
 }
@@ -1917,10 +1939,10 @@ WHERE o.username = ?
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"time"
 
+	"github.com/zalgonoise/x/errors"
 	"github.com/zalgonoise/x/secr/shared"
 )
 
@@ -2269,7 +2291,7 @@ func (a *authz) NewToken(ctx context.Context, u *user.User) (string, error) {
 
 	token, err := tok.SignedString(a.signingKey)
 	if err != nil {
-		return "", fmt.Errorf("failed to sign token: %v", err)
+		return "", fmt.Errorf("failed to sign token: %w", err)
 	}
 	return token, nil
 }
@@ -2294,7 +2316,7 @@ func (a *authz) Parse(ctx context.Context, token string) (*user.User, error) {
 	tok, err := jwt.Parse(token, a.parseToken)
 
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse token: %v", err)
+		return nil, fmt.Errorf("failed to parse token: %w", err)
 	}
 	claims := tok.Claims.(jwt.MapClaims)
 
@@ -2323,7 +2345,7 @@ func (a *authz) Parse(ctx context.Context, token string) (*user.User, error) {
 
 func (a *authz) parseToken(token *jwt.Token) (interface{}, error) {
 	if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-		return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+		return nil, errors.Join(ErrInvalidMethod, fmt.Errorf("unexpected signing method: %v", token.Header["alg"]))
 	}
 	return a.signingKey, nil
 }
@@ -2527,8 +2549,9 @@ Here's the username validation:
 package user
 
 import (
-	"errors"
 	"regexp"
+
+	"github.com/zalgonoise/x/errors"
 )
 
 var (
@@ -2572,8 +2595,9 @@ The name validation is very similar:
 
 ```go
 import (
-	"errors"
 	"regexp"
+
+	"github.com/zalgonoise/x/errors"
 )
 
 
@@ -2617,8 +2641,9 @@ The password validation has a slightly different approach:
 ```go
 
 import (
-	"errors"
 	"regexp"
+
+	"github.com/zalgonoise/x/errors"
 )
 
 var (
@@ -2748,13 +2773,13 @@ For this the following is required:
 
 ```go
 	if err := user.ValidateUsername(username); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidUser, err)
+		return nil, errors.Join(ErrInvalidUser, err)
 	}
 	if err := user.ValidatePassword(password); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidPassword, err)
+		return nil, errors.Join(ErrInvalidPassword, err)
 	}
 	if err := user.ValidateName(name); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidName, err)
+		return nil, errors.Join(ErrInvalidName, err)
 	}
 ```
 
@@ -2763,7 +2788,7 @@ For this the following is required:
 ```go
 	_, err := s.users.Get(ctx, username)
 	if err == nil || !errors.Is(sqlite.ErrNotFoundUser, err) {
-		return nil, fmt.Errorf("failed to create user: %v", ErrAlreadyExistsUser)
+		return nil, errors.Join(ErrAlreadyExistsUser, err)
 	}
 ```
 
@@ -2799,7 +2824,7 @@ For this the following is required:
 ```go
 	id, err := s.users.Create(ctx, u)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create user %s: %v", username, err)
+		return nil, fmt.Errorf("failed to create user %s: %w", username, err)
 	}
 	u.ID = id
 ```
@@ -2810,7 +2835,7 @@ For this the following is required:
 	key := crypt.New32Key()
 	err = s.keys.Set(ctx, keys.UserBucket(u.ID), keys.UniqueID, key[:])
 	if err != nil {
-		return nil, fmt.Errorf("failed to create user %s: %v", username, err)
+		return nil, fmt.Errorf("failed to create user %s: %w", username, err)
 	}
 
 	return u, nil
@@ -2842,7 +2867,6 @@ type RollbackFn func() error
 
 type transactioner struct {
 	r   []RollbackFn
-	err error
 }
 
 func newTx() Transactioner {
@@ -2850,20 +2874,21 @@ func newTx() Transactioner {
 }
 
 func (tx *transactioner) Rollback(input error) error {
+	var errs = make([]error, 0, len(tx.r)+1)
+	errs[0] = input
+
 	for _, rb := range tx.r {
-		err := rb()
-		if err != nil {
-			if tx.err == nil {
-				tx.err = err
-				continue
-			}
-			tx.err = fmt.Errorf("%w -- %v", tx.err, err)
+		if err := rb(); err != nil {
+			errs = append(errs, fmt.Errorf("rollback error: %w", err))
 		}
 	}
-	if tx.err == nil {
-		return input
+	switch len(errs) {
+
+	case 1:
+		return errs[0]
+	default:
+		return errors.Join(errs...)
 	}
-	return fmt.Errorf("%w -- rollback error: %v", input, tx.err)
 }
 
 func (tx *transactioner) Add(r RollbackFn) {
@@ -2876,7 +2901,7 @@ Since the user is being created in user.Repository first (to generate an ID for 
 ```go
 	id, err := s.users.Create(ctx, u)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create user %s: %v", username, err)
+		return nil, fmt.Errorf("failed to create user %s: %w", username, err)
 	}
 	u.ID = id
 
@@ -2889,7 +2914,7 @@ Since the user is being created in user.Repository first (to generate an ID for 
 	key := crypt.New32Key()
 	err = s.keys.Set(ctx, keys.UserBucket(u.ID), keys.UniqueID, key[:])
 	if err != nil {
-		return nil, tx.Rollback(fmt.Errorf("failed to create user %s: %v", username, err))
+		return nil, tx.Rollback(fmt.Errorf("failed to create user %s: %w", username, err))
 	}
 ```
 
@@ -2900,19 +2925,19 @@ The whole thing looks like this:
 // It returns a user and an error
 func (s service) CreateUser(ctx context.Context, username, password, name string) (*user.User, error) {
 	if err := user.ValidateUsername(username); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidUser, err)
+		return nil, errors.Join(ErrInvalidUser, err)
 	}
 	if err := user.ValidatePassword(password); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidPassword, err)
+		return nil, errors.Join(ErrInvalidPassword, err)
 	}
 	if err := user.ValidateName(name); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidName, err)
+		return nil, errors.Join(ErrInvalidName, err)
 	}
 
 	// check if user exists
 	_, err := s.users.Get(ctx, username)
 	if err == nil || !errors.Is(sqlite.ErrNotFoundUser, err) {
-		return nil, fmt.Errorf("failed to create user: %v", ErrAlreadyExistsUser)
+		return nil, errors.Join(ErrAlreadyExistsUser, err)
 	}
 
 	// generate hash from password
@@ -2931,7 +2956,7 @@ func (s service) CreateUser(ctx context.Context, username, password, name string
 	}
 	id, err := s.users.Create(ctx, u)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create user %s: %v", username, err)
+		return nil, fmt.Errorf("failed to create user %s: %w", username, err)
 	}
 	u.ID = id
 
@@ -2944,7 +2969,7 @@ func (s service) CreateUser(ctx context.Context, username, password, name string
 	key := crypt.New32Key()
 	err = s.keys.Set(ctx, keys.UserBucket(u.ID), keys.UniqueID, key[:])
 	if err != nil {
-		return nil, tx.Rollback(fmt.Errorf("failed to create user %s: %v", username, err))
+		return nil, tx.Rollback(fmt.Errorf("failed to create user %s: %w", username, err))
 	}
 
 	return u, nil
@@ -2959,12 +2984,12 @@ This method fetches a user from the user.Repository, by its username. It's much 
 // GetUser fetches the user with username `username`. Returns a user and an error
 func (s service) GetUser(ctx context.Context, username string) (*user.User, error) {
 	if err := user.ValidateUsername(username); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidUser, err)
+		return nil, errors.Join(ErrInvalidUser, err)
 	}
 
 	u, err := s.users.Get(ctx, username)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get user %s: %v", username, err)
+		return nil, fmt.Errorf("failed to get user %s: %w", username, err)
 	}
 	return u, nil
 }
@@ -2980,7 +3005,7 @@ Same goes for `ListUsers` -- but this one doesn't require any validation:
 func (s service) ListUsers(ctx context.Context) ([]*user.User, error) {
 	users, err := s.users.List(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list users: %v", err)
+		return nil, fmt.Errorf("failed to list users: %w", err)
 	}
 	return users, nil
 }
@@ -3002,13 +3027,13 @@ For the username there is already a validator function, but for the updated obje
 
 ```go
 	if err := user.ValidateUsername(username); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidUser, err)
+		return errors.Join(ErrInvalidUser, err)
 	}
 	if updated == nil {
 		return fmt.Errorf("%w: updated user cannot be nil", ErrInvalidUser)
 	}
 	if err := user.ValidateName(updated.Name); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidName, err)
+		return errors.Join(ErrInvalidName, err)
 	}
 ```
 
@@ -3017,7 +3042,7 @@ For the username there is already a validator function, but for the updated obje
 ```go
 	u, err := s.users.Get(ctx, username)
 	if err != nil {
-		return fmt.Errorf("failed to fetch original user %s: %v", username, err)
+		return fmt.Errorf("failed to fetch original user %s: %w", username, err)
 	}
 ```
 
@@ -3036,7 +3061,7 @@ For the username there is already a validator function, but for the updated obje
 ```go
 	err = s.users.Update(ctx, username, u)
 	if err != nil {
-		return fmt.Errorf("failed to update user %s: %v", username, err)
+		return fmt.Errorf("failed to update user %s: %w", username, err)
 	}
 
 	return nil
@@ -3048,18 +3073,18 @@ Here's the whole thing:
 // UpdateUser updates the user `username`'s name, found in `updated` user. Returns an error
 func (s service) UpdateUser(ctx context.Context, username string, updated *user.User) error {
 	if err := user.ValidateUsername(username); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidUser, err)
+		return errors.Join(ErrInvalidUser, err)
 	}
 	if updated == nil {
 		return fmt.Errorf("%w: updated user cannot be nil", ErrInvalidUser)
 	}
 	if err := user.ValidateName(updated.Name); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidName, err)
+		return errors.Join(ErrInvalidName, err)
 	}
 
 	u, err := s.users.Get(ctx, username)
 	if err != nil {
-		return fmt.Errorf("failed to fetch original user %s: %v", username, err)
+		return fmt.Errorf("failed to fetch original user %s: %w", username, err)
 	}
 	if updated.Name == u.Name {
 		// no changes to be made
@@ -3069,7 +3094,7 @@ func (s service) UpdateUser(ctx context.Context, username string, updated *user.
 
 	err = s.users.Update(ctx, username, u)
 	if err != nil {
-		return fmt.Errorf("failed to update user %s: %v", username, err)
+		return fmt.Errorf("failed to update user %s: %w", username, err)
 	}
 
 	return nil
@@ -3088,7 +3113,7 @@ These are the required actions to remove a user:
 
 ```go
 	if err := user.ValidateUsername(username); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidUser, err)
+		return errors.Join(ErrInvalidUser, err)
 	}
 ```
 
@@ -3101,7 +3126,7 @@ These are the required actions to remove a user:
 			// no change in state
 			return nil
 		}
-		return fmt.Errorf("failed to fetch original user %s: %v", username, err)
+		return fmt.Errorf("failed to fetch original user %s: %w", username, err)
 	}
 ```
 
@@ -3110,7 +3135,7 @@ These are the required actions to remove a user:
 ```go
 	shares, err := s.shares.List(ctx, username)
 	if err != nil {
-		return fmt.Errorf("failed to fetch shared secrets: %v", err)
+		return fmt.Errorf("failed to fetch shared secrets: %w", err)
 	}
 	for _, sh := range shares {
 		err := s.shares.Delete(ctx, sh)
@@ -3125,7 +3150,7 @@ These are the required actions to remove a user:
 ```go
 	secrets, err := s.secrets.List(ctx, username)
 	if err != nil {
-		return fmt.Errorf("failed to list user secrets: %v", err)
+		return fmt.Errorf("failed to list user secrets: %w", err)
 	}
 	for _, secr := range secrets {
 		err := s.secrets.Delete(ctx, username, secr.Key)
@@ -3140,7 +3165,7 @@ These are the required actions to remove a user:
 ```go
 	err = s.keys.Delete(ctx, keys.UserBucket(u.ID), keys.UniqueID)
 	if err != nil {
-		return fmt.Errorf("failed to delete user %s's key: %v", username, err)
+		return fmt.Errorf("failed to delete user %s's key: %w", username, err)
 	}
 ```
 
@@ -3149,7 +3174,7 @@ These are the required actions to remove a user:
 ```go
 	err = s.users.Delete(ctx, username)
 	if err != nil {
-		return fmt.Errorf("failed to delete user %s: %v", username, err)
+		return fmt.Errorf("failed to delete user %s: %w", username, err)
 	}
 
 	return nil
@@ -3168,7 +3193,7 @@ Reviewing some of the steps with this in mind:
 
 	shares, err := s.shares.List(ctx, username)
 	if err != nil {
-		return fmt.Errorf("failed to fetch shared secrets: %v", err)
+		return fmt.Errorf("failed to fetch shared secrets: %w", err)
 	}
 	for _, sh := range shares {
 		tx.Add(func() error {
@@ -3178,7 +3203,7 @@ Reviewing some of the steps with this in mind:
 
 		err := s.shares.Delete(ctx, sh)
 		if err != nil {
-			return tx.Rollback(fmt.Errorf("failed to remove shared secret: %v", err))
+			return tx.Rollback(fmt.Errorf("failed to remove shared secret: %w", err))
 		}
 	}
 ```
@@ -3188,7 +3213,7 @@ Reviewing some of the steps with this in mind:
 ```go
 	secrets, err := s.secrets.List(ctx, username)
 	if err != nil {
-		return fmt.Errorf("failed to list user secrets: %v", err)
+		return fmt.Errorf("failed to list user secrets: %w", err)
 	}
 	for _, secr := range secrets {
 		tx.Add(func() error {
@@ -3198,7 +3223,7 @@ Reviewing some of the steps with this in mind:
 
 		err := s.secrets.Delete(ctx, username, secr.Key)
 		if err != nil {
-			return tx.Rollback(fmt.Errorf("failed to remove secret: %v", err))
+			return tx.Rollback(fmt.Errorf("failed to remove secret: %w", err))
 		}
 	}
 ```
@@ -3208,7 +3233,7 @@ Reviewing some of the steps with this in mind:
 ```go
 	upk, err := s.keys.Get(ctx, keys.UserBucket(u.ID), keys.UniqueID)
 	if err != nil {
-		return fmt.Errorf("failed to fetch user %s's key: %v", username, err)
+		return fmt.Errorf("failed to fetch user %s's key: %w", username, err)
 	}
 	tx.Add(func() error {
 		return s.keys.Set(ctx, keys.UserBucket(u.ID), keys.UniqueID, upk)
@@ -3217,7 +3242,7 @@ Reviewing some of the steps with this in mind:
 	// delete private key
 	err = s.keys.Delete(ctx, keys.UserBucket(u.ID), keys.UniqueID)
 	if err != nil {
-		return tx.Rollback(fmt.Errorf("failed to delete user %s's key: %v", username, err))
+		return tx.Rollback(fmt.Errorf("failed to delete user %s's key: %w", username, err))
 	}
 ```
 
@@ -3226,7 +3251,7 @@ Reviewing some of the steps with this in mind:
 ```go
 	err = s.users.Delete(ctx, username)
 	if err != nil {
-		return tx.Rollback(fmt.Errorf("failed to delete user %s: %v", username, err))
+		return tx.Rollback(fmt.Errorf("failed to delete user %s: %w", username, err))
 	}
 
 	return nil
@@ -3240,7 +3265,7 @@ Here is the whole method body:
 // DeleteUser removes the user with username `username`. Returns an error
 func (s service) DeleteUser(ctx context.Context, username string) error {
 	if err := user.ValidateUsername(username); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidUser, err)
+		return errors.Join(ErrInvalidUser, err)
 	}
 
 	u, err := s.users.Get(ctx, username)
@@ -3249,7 +3274,7 @@ func (s service) DeleteUser(ctx context.Context, username string) error {
 			// no change in state
 			return nil
 		}
-		return fmt.Errorf("failed to fetch original user %s: %v", username, err)
+		return fmt.Errorf("failed to fetch original user %s: %w", username, err)
 	}
 
 	tx := newTx()
@@ -3257,7 +3282,7 @@ func (s service) DeleteUser(ctx context.Context, username string) error {
 	// remove all shares
 	shares, err := s.shares.List(ctx, username)
 	if err != nil {
-		return fmt.Errorf("failed to fetch shared secrets: %v", err)
+		return fmt.Errorf("failed to fetch shared secrets: %w", err)
 	}
 	for _, sh := range shares {
 		tx.Add(func() error {
@@ -3267,14 +3292,14 @@ func (s service) DeleteUser(ctx context.Context, username string) error {
 
 		err := s.shares.Delete(ctx, sh)
 		if err != nil {
-			return tx.Rollback(fmt.Errorf("failed to remove shared secret: %v", err))
+			return tx.Rollback(fmt.Errorf("failed to remove shared secret: %w", err))
 		}
 	}
 
 	// remove all secrets
 	secrets, err := s.secrets.List(ctx, username)
 	if err != nil {
-		return fmt.Errorf("failed to list user secrets: %v", err)
+		return fmt.Errorf("failed to list user secrets: %w", err)
 	}
 	for _, secr := range secrets {
 		tx.Add(func() error {
@@ -3284,14 +3309,14 @@ func (s service) DeleteUser(ctx context.Context, username string) error {
 
 		err := s.secrets.Delete(ctx, username, secr.Key)
 		if err != nil {
-			return tx.Rollback(fmt.Errorf("failed to remove secret: %v", err))
+			return tx.Rollback(fmt.Errorf("failed to remove secret: %w", err))
 		}
 	}
 
 	// get user's private key for rollback func
 	upk, err := s.keys.Get(ctx, keys.UserBucket(u.ID), keys.UniqueID)
 	if err != nil {
-		return fmt.Errorf("failed to fetch user %s's key: %v", username, err)
+		return fmt.Errorf("failed to fetch user %s's key: %w", username, err)
 	}
 	tx.Add(func() error {
 		return s.keys.Set(ctx, keys.UserBucket(u.ID), keys.UniqueID, upk)
@@ -3300,13 +3325,13 @@ func (s service) DeleteUser(ctx context.Context, username string) error {
 	// delete private key
 	err = s.keys.Delete(ctx, keys.UserBucket(u.ID), keys.UniqueID)
 	if err != nil {
-		return tx.Rollback(fmt.Errorf("failed to delete user %s's key: %v", username, err))
+		return tx.Rollback(fmt.Errorf("failed to delete user %s's key: %w", username, err))
 	}
 
 	// delete user
 	err = s.users.Delete(ctx, username)
 	if err != nil {
-		return tx.Rollback(fmt.Errorf("failed to delete user %s: %v", username, err))
+		return tx.Rollback(fmt.Errorf("failed to delete user %s: %w", username, err))
 	}
 
 	return nil
@@ -3332,10 +3357,10 @@ Here is the keys validation:
 
 ```go
 import (
-	"errors"
 	"regexp"
 	"strings"
 
+	"github.com/zalgonoise/x/errors"
 	"github.com/zalgonoise/x/secr/keys"
 	"github.com/zalgonoise/x/secr/user"
 )
@@ -3472,13 +3497,13 @@ Here is a recap of these actions and code to follow along:
 
 ```go
 	if err := user.ValidateUsername(username); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidUser, err)
+		return errors.Join(ErrInvalidUser, err)
 	}
 	if isShared, err := secret.ValidateKey(key); err != nil || isShared {
-		return fmt.Errorf("%w: %v", ErrInvalidKey, err)
+		return errors.Join(ErrInvalidKey, err)
 	}
 	if err := secret.ValidateValue(value); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidValue, err)
+		return errors.Join(ErrInvalidValue, err)
 	}
 ```
 
@@ -3487,7 +3512,7 @@ Here is a recap of these actions and code to follow along:
 ```go
 	u, err := s.users.Get(ctx, username)
 	if err != nil {
-		return fmt.Errorf("failed to fetch user: %v", err)
+		return fmt.Errorf("failed to fetch user: %w", err)
 	}
 ```
 
@@ -3498,7 +3523,7 @@ Here is a recap of these actions and code to follow along:
 
 	oldSecr, err := s.secrets.Get(ctx, username, key)
 	if err != nil && !errors.Is(sqlite.ErrNotFoundSecret, err) {
-		return fmt.Errorf("failed to fetch previous secret under this key: %v", err)
+		return fmt.Errorf("failed to fetch previous secret under this key: %w", err)
 	}
 ```
 
@@ -3508,7 +3533,7 @@ Here is a recap of these actions and code to follow along:
 	if oldSecr != nil {
 		shares, err := s.shares.Get(ctx, username, oldSecr.Key)
 		if err != nil && !errors.Is(sqlite.ErrNotFoundShare, err) {
-			return fmt.Errorf("failed to fetch previous shared secrets: %v", err)
+			return fmt.Errorf("failed to fetch previous shared secrets: %w", err)
 		}
 	// (...)
 	}
@@ -3526,7 +3551,7 @@ Here is a recap of these actions and code to follow along:
 			})
 			err := s.shares.Delete(ctx, sh)
 			if err != nil {
-				return tx.Rollback(fmt.Errorf("failed to remove old share: %v", err))
+				return tx.Rollback(fmt.Errorf("failed to remove old share: %w", err))
 			}
 		}
 	// (...)
@@ -3540,7 +3565,7 @@ Here is a recap of these actions and code to follow along:
 	// (...)
 		val, err := s.keys.Get(ctx, keys.UserBucket(u.ID), key)
 		if err != nil {
-			return tx.Rollback(fmt.Errorf("failed to fetch old secret's value: %v", err))
+			return tx.Rollback(fmt.Errorf("failed to fetch old secret's value: %w", err))
 		}
 		tx.Add(func() error {
 			return s.keys.Set(ctx, keys.UserBucket(u.ID), key, val)
@@ -3557,7 +3582,7 @@ Here is a recap of these actions and code to follow along:
 	// (...)
 		err = s.keys.Delete(ctx, keys.UserBucket(u.ID), key)
 		if err != nil {
-			return tx.Rollback(fmt.Errorf("failed to remove old secret's value: %v", err))
+			return tx.Rollback(fmt.Errorf("failed to remove old secret's value: %w", err))
 		}
 	// (...)
 	}
@@ -3574,7 +3599,7 @@ Here is a recap of these actions and code to follow along:
 		})
 		err = s.secrets.Delete(ctx, username, key)
 		if err != nil {
-			return tx.Rollback(fmt.Errorf("failed to remove old secret: %v", err))
+			return tx.Rollback(fmt.Errorf("failed to remove old secret: %w", err))
 		}
 	}
 ```
@@ -3584,7 +3609,7 @@ Here is a recap of these actions and code to follow along:
 ```go
 	cipherKey, err := s.keys.Get(ctx, keys.UserBucket(u.ID), keys.UniqueID)
 	if err != nil {
-		return tx.Rollback(fmt.Errorf("failed to get user's private key: %v", err))
+		return tx.Rollback(fmt.Errorf("failed to get user's private key: %w", err))
 	}
 ```
 
@@ -3594,7 +3619,7 @@ Here is a recap of these actions and code to follow along:
 	cipher := crypt.NewCipher(cipherKey)
 	encValue, err := cipher.Encrypt(value)
 	if err != nil {
-		return tx.Rollback(fmt.Errorf("failed to encrypt value: %v", err))
+		return tx.Rollback(fmt.Errorf("failed to encrypt value: %w", err))
 	}
 ```
 
@@ -3603,7 +3628,7 @@ Here is a recap of these actions and code to follow along:
 ```go
 	err = s.keys.Set(ctx, keys.UserBucket(u.ID), key, encValue)
 	if err != nil {
-		return tx.Rollback(fmt.Errorf("failed to store the secret: %v", err))
+		return tx.Rollback(fmt.Errorf("failed to store the secret: %w", err))
 	}
 	tx.Add(func() error {
 		if oldSecr == nil {
@@ -3621,7 +3646,7 @@ Here is a recap of these actions and code to follow along:
 	}
 	id, err := s.secrets.Create(ctx, username, secr)
 	if err != nil {
-		return tx.Rollback(fmt.Errorf("failed to create the secret: %v", err))
+		return tx.Rollback(fmt.Errorf("failed to create the secret: %w", err))
 	}
 ```
 
@@ -3632,18 +3657,18 @@ Here is how the whole thing looks:
 // user `username`. It returns an error
 func (s service) CreateSecret(ctx context.Context, username string, key string, value []byte) error {
 	if err := user.ValidateUsername(username); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidUser, err)
+		return errors.Join(ErrInvalidUser, err)
 	}
 	if isShared, err := secret.ValidateKey(key); err != nil || isShared {
-		return fmt.Errorf("%w: %v", ErrInvalidKey, err)
+		return errors.Join(ErrInvalidKey, err)
 	}
 	if err := secret.ValidateValue(value); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidValue, err)
+		return errors.Join(ErrInvalidValue, err)
 	}
 
 	u, err := s.users.Get(ctx, username)
 	if err != nil {
-		return fmt.Errorf("failed to fetch user: %v", err)
+		return fmt.Errorf("failed to fetch user: %w", err)
 	}
 
 	tx := newTx()
@@ -3651,13 +3676,13 @@ func (s service) CreateSecret(ctx context.Context, username string, key string, 
 	// check if secret already exists
 	oldSecr, err := s.secrets.Get(ctx, username, key)
 	if err != nil && !errors.Is(sqlite.ErrNotFoundSecret, err) {
-		return fmt.Errorf("failed to fetch previous secret under this key: %v", err)
+		return fmt.Errorf("failed to fetch previous secret under this key: %w", err)
 	}
 	if oldSecr != nil {
 		// remove old shares if they exist
 		shares, err := s.shares.Get(ctx, username, oldSecr.Key)
 		if err != nil && !errors.Is(sqlite.ErrNotFoundShare, err) {
-			return fmt.Errorf("failed to fetch previous shared secrets: %v", err)
+			return fmt.Errorf("failed to fetch previous shared secrets: %w", err)
 		}
 		for _, sh := range shares {
 			tx.Add(func() error {
@@ -3666,14 +3691,14 @@ func (s service) CreateSecret(ctx context.Context, username string, key string, 
 			})
 			err := s.shares.Delete(ctx, sh)
 			if err != nil {
-				return tx.Rollback(fmt.Errorf("failed to remove old share: %v", err))
+				return tx.Rollback(fmt.Errorf("failed to remove old share: %w", err))
 			}
 		}
 
 		// get encrypted value for existing secret (for RollbackFn)
 		val, err := s.keys.Get(ctx, keys.UserBucket(u.ID), key)
 		if err != nil {
-			return tx.Rollback(fmt.Errorf("failed to fetch old secret's value: %v", err))
+			return tx.Rollback(fmt.Errorf("failed to fetch old secret's value: %w", err))
 		}
 		tx.Add(func() error {
 			return s.keys.Set(ctx, keys.UserBucket(u.ID), key, val)
@@ -3682,7 +3707,7 @@ func (s service) CreateSecret(ctx context.Context, username string, key string, 
 		// remove it
 		err = s.keys.Delete(ctx, keys.UserBucket(u.ID), key)
 		if err != nil {
-			return tx.Rollback(fmt.Errorf("failed to remove old secret's value: %v", err))
+			return tx.Rollback(fmt.Errorf("failed to remove old secret's value: %w", err))
 		}
 
 		tx.Add(func() error {
@@ -3692,7 +3717,7 @@ func (s service) CreateSecret(ctx context.Context, username string, key string, 
 		// remove the secret's metadata
 		err = s.secrets.Delete(ctx, username, key)
 		if err != nil {
-			return tx.Rollback(fmt.Errorf("failed to remove old secret: %v", err))
+			return tx.Rollback(fmt.Errorf("failed to remove old secret: %w", err))
 		}
 	}
 
@@ -3700,20 +3725,20 @@ func (s service) CreateSecret(ctx context.Context, username string, key string, 
 	// fetch the key
 	cipherKey, err := s.keys.Get(ctx, keys.UserBucket(u.ID), keys.UniqueID)
 	if err != nil {
-		return tx.Rollback(fmt.Errorf("failed to get user's private key: %v", err))
+		return tx.Rollback(fmt.Errorf("failed to get user's private key: %w", err))
 	}
 
 	// encrypt value with user's private key
 	cipher := crypt.NewCipher(cipherKey)
 	encValue, err := cipher.Encrypt(value)
 	if err != nil {
-		return tx.Rollback(fmt.Errorf("failed to encrypt value: %v", err))
+		return tx.Rollback(fmt.Errorf("failed to encrypt value: %w", err))
 	}
 
 	// store encrypted value
 	err = s.keys.Set(ctx, keys.UserBucket(u.ID), key, encValue)
 	if err != nil {
-		return tx.Rollback(fmt.Errorf("failed to store the secret: %v", err))
+		return tx.Rollback(fmt.Errorf("failed to store the secret: %w", err))
 	}
 	tx.Add(func() error {
 		if oldSecr == nil {
@@ -3729,7 +3754,7 @@ func (s service) CreateSecret(ctx context.Context, username string, key string, 
 	// create secret
 	id, err := s.secrets.Create(ctx, username, secr)
 	if err != nil {
-		return tx.Rollback(fmt.Errorf("failed to create the secret: %v", err))
+		return tx.Rollback(fmt.Errorf("failed to create the secret: %w", err))
 	}
 	secr.ID = id
 
@@ -3757,11 +3782,11 @@ Below is how `GetSecret` looks like. When the secret key validation indicates th
 // GetSecret fetches the secret with key `key`, for user `username`. Returns a secret and an error
 func (s service) GetSecret(ctx context.Context, username string, key string) (*secret.Secret, error) {
 	if err := user.ValidateUsername(username); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidUser, err)
+		return nil, errors.Join(ErrInvalidUser, err)
 	}
 	isShared, err := secret.ValidateKey(key)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidKey, err)
+		return nil, errors.Join(ErrInvalidKey, err)
 	}
 
 	// handle fetching an owned secret vs a shared secret
@@ -3785,7 +3810,7 @@ As for `getSecret`, it has the same signature as `GetSecret`:
 ```go
 	u, err := s.users.Get(ctx, username)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch user: %v", err)
+		return nil, fmt.Errorf("failed to fetch user: %w", err)
 	}
 ```
 
@@ -3794,7 +3819,7 @@ As for `getSecret`, it has the same signature as `GetSecret`:
 ```go
 	secr, err := s.secrets.Get(ctx, username, key)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch the secret: %v", err)
+		return nil, fmt.Errorf("failed to fetch the secret: %w", err)
 	}
 ```
 
@@ -3803,7 +3828,7 @@ As for `getSecret`, it has the same signature as `GetSecret`:
 ```go
 	cipherKey, err := s.keys.Get(ctx, keys.UserBucket(u.ID), keys.UniqueID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch the user's private key: %v", err)
+		return nil, fmt.Errorf("failed to fetch the user's private key: %w", err)
 	}
 	cipher := crypt.NewCipher(cipherKey)
 ```
@@ -3813,7 +3838,7 @@ As for `getSecret`, it has the same signature as `GetSecret`:
 ```go
 	encValue, err := s.keys.Get(ctx, keys.UserBucket(u.ID), key)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch the secret: %v", err)
+		return nil, fmt.Errorf("failed to fetch the secret: %w", err)
 	}
 ```
 
@@ -3822,7 +3847,7 @@ As for `getSecret`, it has the same signature as `GetSecret`:
 ```go
 	decValue, err := cipher.Decrypt(encValue)
 	if err != nil {
-		return nil, fmt.Errorf("failed to decrypt value: %v", err)
+		return nil, fmt.Errorf("failed to decrypt value: %w", err)
 	}
 
 	secr.Value = string(decValue)
@@ -3834,32 +3859,32 @@ This is how `getSecret` looks like as a whole:
 func (s service) getSecret(ctx context.Context, username, key string) (*secret.Secret, error) {
 	u, err := s.users.Get(ctx, username)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch user: %v", err)
+		return nil, fmt.Errorf("failed to fetch user: %w", err)
 	}
 
 	// fetch secret('s metadata )
 	secr, err := s.secrets.Get(ctx, username, key)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch the secret: %v", err)
+		return nil, fmt.Errorf("failed to fetch the secret: %w", err)
 	}
 
 	// fetch user's private key to decode encrypted secret
 	cipherKey, err := s.keys.Get(ctx, keys.UserBucket(u.ID), keys.UniqueID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch the user's private key: %v", err)
+		return nil, fmt.Errorf("failed to fetch the user's private key: %w", err)
 	}
 	cipher := crypt.NewCipher(cipherKey)
 
 	// fetch secret's value
 	encValue, err := s.keys.Get(ctx, keys.UserBucket(u.ID), key)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch the secret: %v", err)
+		return nil, fmt.Errorf("failed to fetch the secret: %w", err)
 	}
 
 	// decrypt value with user's private key
 	decValue, err := cipher.Decrypt(encValue)
 	if err != nil {
-		return nil, fmt.Errorf("failed to decrypt value: %v", err)
+		return nil, fmt.Errorf("failed to decrypt value: %w", err)
 	}
 
 	secr.Value = string(decValue)
@@ -3880,7 +3905,7 @@ Now for the shared secret routine:
 ```go
 	sh, err := s.shares.Get(ctx, owner, key)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch shared secret metadata: %v", err)
+		return nil, fmt.Errorf("failed to fetch shared secret metadata: %w", err)
 	}
 ```
 
@@ -3901,7 +3926,7 @@ Now for the shared secret routine:
 			if time.Now().After(*share.Until) {
 				err := s.shares.Delete(ctx, share)
 				if err != nil {
-					return nil, fmt.Errorf("failed to remove expired shared secret: %v", err)
+					return nil, fmt.Errorf("failed to remove expired shared secret: %w", err)
 				}
 				continue
 			}
@@ -3939,7 +3964,7 @@ Now for the shared secret routine:
 ```go
 	secr, err := s.getSecret(ctx, owner, key)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch shared secret: %v", err)
+		return nil, fmt.Errorf("failed to fetch shared secret: %w", err)
 	}
 ```
 
@@ -3957,7 +3982,7 @@ func (s service) getSharedSecret(ctx context.Context, owner, key, target string)
 	// get the original share (as if it was the owner)
 	sh, err := s.shares.Get(ctx, owner, key)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch shared secret metadata: %v", err)
+		return nil, fmt.Errorf("failed to fetch shared secret metadata: %w", err)
 	}
 
 	var validShare *shared.Share
@@ -3968,7 +3993,7 @@ func (s service) getSharedSecret(ctx context.Context, owner, key, target string)
 				// remove it if expired
 				err := s.shares.Delete(ctx, share)
 				if err != nil {
-					return nil, fmt.Errorf("failed to remove expired shared secret: %v", err)
+					return nil, fmt.Errorf("failed to remove expired shared secret: %w", err)
 				}
 				continue
 			}
@@ -3991,7 +4016,7 @@ func (s service) getSharedSecret(ctx context.Context, owner, key, target string)
 	// fetch the deciphered secret
 	secr, err := s.getSecret(ctx, owner, key)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch shared secret: %v", err)
+		return nil, fmt.Errorf("failed to fetch shared secret: %w", err)
 	}
 	// erase creation time; set key as `user:key`
 	secr.CreatedAt = time.Time{}
@@ -4010,7 +4035,7 @@ There are a lot of similarities from the previous chapter, with differences in t
 
 ```go
 	if err := user.ValidateUsername(username); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidUser, err)
+		return nil, errors.Join(ErrInvalidUser, err)
 	}
 ```
 
@@ -4019,7 +4044,7 @@ There are a lot of similarities from the previous chapter, with differences in t
 ```go
 	u, err := s.users.Get(ctx, username)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch user: %v", err)
+		return nil, fmt.Errorf("failed to fetch user: %w", err)
 	}
 ```
 
@@ -4028,7 +4053,7 @@ There are a lot of similarities from the previous chapter, with differences in t
 ```go
 	secrets, err := s.secrets.List(ctx, username)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list the user's secrets: %v", err)
+		return nil, fmt.Errorf("failed to list the user's secrets: %w", err)
 	}
 ```
 
@@ -4037,7 +4062,7 @@ There are a lot of similarities from the previous chapter, with differences in t
 ```go
 	cipherKey, err := s.keys.Get(ctx, keys.UserBucket(u.ID), keys.UniqueID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch the user's private key: %v", err)
+		return nil, fmt.Errorf("failed to fetch the user's private key: %w", err)
 	}
 	cipher := crypt.NewCipher(cipherKey)
 ```
@@ -4048,12 +4073,12 @@ There are a lot of similarities from the previous chapter, with differences in t
 	for _, secr := range secrets {
 		encValue, err := s.keys.Get(ctx, keys.UserBucket(u.ID), secr.Key)
 		if err != nil {
-			return nil, fmt.Errorf("failed to fetch the secret: %v", err)
+			return nil, fmt.Errorf("failed to fetch the secret: %w", err)
 		}
 
 		decValue, err := cipher.Decrypt(encValue)
 		if err != nil {
-			return nil, fmt.Errorf("failed to decrypt value: %v", err)
+			return nil, fmt.Errorf("failed to decrypt value: %w", err)
 		}
 
 		secr.Value = string(decValue)
@@ -4065,7 +4090,7 @@ There are a lot of similarities from the previous chapter, with differences in t
 ```go
 	sharedSecrets, err := s.shares.ListTarget(ctx, username)
 	if err != nil {
-		return secrets, fmt.Errorf("failed to fetch secrets shared with %s: %v", username, err)
+		return secrets, fmt.Errorf("failed to fetch secrets shared with %s: %w", username, err)
 	}
 ```
 
@@ -4078,7 +4103,7 @@ There are a lot of similarities from the previous chapter, with differences in t
 			if errors.Is(ErrZeroShares, err) {
 				continue
 			}
-			return secrets, fmt.Errorf("failed to fetch secrets shared with %s: %v", username, err)
+			return secrets, fmt.Errorf("failed to fetch secrets shared with %s: %w", username, err)
 		}
 		secrets = append(secrets, sharedSecr)
 	}
@@ -4090,24 +4115,24 @@ Here is how the entire thing looks:
 // ListSecrets retuns all secrets for user `username`. Returns a list of secrets and an error
 func (s service) ListSecrets(ctx context.Context, username string) ([]*secret.Secret, error) {
 	if err := user.ValidateUsername(username); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidUser, err)
+		return nil, errors.Join(ErrInvalidUser, err)
 	}
 
 	u, err := s.users.Get(ctx, username)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch user: %v", err)
+		return nil, fmt.Errorf("failed to fetch user: %w", err)
 	}
 
 	// fetch secrets(' metadata )
 	secrets, err := s.secrets.List(ctx, username)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list the user's secrets: %v", err)
+		return nil, fmt.Errorf("failed to list the user's secrets: %w", err)
 	}
 
 	// fetch user's private key to decode encrypted secret
 	cipherKey, err := s.keys.Get(ctx, keys.UserBucket(u.ID), keys.UniqueID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch the user's private key: %v", err)
+		return nil, fmt.Errorf("failed to fetch the user's private key: %w", err)
 	}
 	cipher := crypt.NewCipher(cipherKey)
 
@@ -4116,13 +4141,13 @@ func (s service) ListSecrets(ctx context.Context, username string) ([]*secret.Se
 		// fetch secret's value
 		encValue, err := s.keys.Get(ctx, keys.UserBucket(u.ID), secr.Key)
 		if err != nil {
-			return nil, fmt.Errorf("failed to fetch the secret: %v", err)
+			return nil, fmt.Errorf("failed to fetch the secret: %w", err)
 		}
 
 		// decrypt value with user's private key
 		decValue, err := cipher.Decrypt(encValue)
 		if err != nil {
-			return nil, fmt.Errorf("failed to decrypt value: %v", err)
+			return nil, fmt.Errorf("failed to decrypt value: %w", err)
 		}
 
 		secr.Value = string(decValue)
@@ -4131,7 +4156,7 @@ func (s service) ListSecrets(ctx context.Context, username string) ([]*secret.Se
 	// aggregate secrets that are shared with this user
 	sharedSecrets, err := s.shares.ListTarget(ctx, username)
 	if err != nil {
-		return secrets, fmt.Errorf("failed to fetch secrets shared with %s: %v", username, err)
+		return secrets, fmt.Errorf("failed to fetch secrets shared with %s: %w", username, err)
 	}
 	for _, sh := range sharedSecrets {
 		// extract secret from shared secret
@@ -4140,7 +4165,7 @@ func (s service) ListSecrets(ctx context.Context, username string) ([]*secret.Se
 			if errors.Is(ErrZeroShares, err) {
 				continue
 			}
-			return secrets, fmt.Errorf("failed to fetch secrets shared with %s: %v", username, err)
+			return secrets, fmt.Errorf("failed to fetch secrets shared with %s: %w", username, err)
 		}
 		// append results
 		secrets = append(secrets, sharedSecr)
@@ -4158,10 +4183,10 @@ Deleting a secret will involve a transaction, since its shares will also be remo
 
 ```go
 	if err := user.ValidateUsername(username); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidUser, err)
+		return errors.Join(ErrInvalidUser, err)
 	}
 	if isShared, err := secret.ValidateKey(key); err != nil || isShared {
-		return fmt.Errorf("%w: %v", ErrInvalidKey, err)
+		return errors.Join(ErrInvalidKey, err)
 	}
 ```
 
@@ -4170,7 +4195,7 @@ Deleting a secret will involve a transaction, since its shares will also be remo
 ```go
 	u, err := s.users.Get(ctx, username)
 	if err != nil {
-		return fmt.Errorf("failed to fetch user: %v", err)
+		return fmt.Errorf("failed to fetch user: %w", err)
 	}
 ```
 
@@ -4180,7 +4205,7 @@ Deleting a secret will involve a transaction, since its shares will also be remo
 	tx := newTx()
 	shares, err := s.shares.Get(ctx, username, key)
 	if err != nil && !errors.Is(sqlite.ErrNotFoundShare, err) {
-		return fmt.Errorf("failed to list shared secrets: %v", err)
+		return fmt.Errorf("failed to list shared secrets: %w", err)
 	}
 	for _, sh := range shares {
 		tx.Add(func() error {
@@ -4189,7 +4214,7 @@ Deleting a secret will involve a transaction, since its shares will also be remo
 		})
 		err := s.shares.Delete(ctx, sh)
 		if err != nil {
-			return tx.Rollback(fmt.Errorf("failed to remove shared secret: %v", err))
+			return tx.Rollback(fmt.Errorf("failed to remove shared secret: %w", err))
 		}
 	}
 ```
@@ -4203,7 +4228,7 @@ Deleting a secret will involve a transaction, since its shares will also be remo
 			// nothing to delete, no changes in state
 			return nil
 		}
-		return tx.Rollback(fmt.Errorf("failed to fetch the secret: %v", err))
+		return tx.Rollback(fmt.Errorf("failed to fetch the secret: %w", err))
 	}
 	tx.Add(func() error {
 		return s.keys.Set(ctx, keys.UserBucket(u.ID), key, secr)
@@ -4215,7 +4240,7 @@ Deleting a secret will involve a transaction, since its shares will also be remo
 ```go
 	err = s.keys.Delete(ctx, keys.UserBucket(u.ID), key)
 	if err != nil {
-		return tx.Rollback(fmt.Errorf("failed to remove secret: %v", err))
+		return tx.Rollback(fmt.Errorf("failed to remove secret: %w", err))
 	}
 ```
 
@@ -4224,7 +4249,7 @@ Deleting a secret will involve a transaction, since its shares will also be remo
 ```go
 	secretMeta, err := s.secrets.Get(ctx, username, key)
 	if err != nil {
-		return tx.Rollback(fmt.Errorf("failed to fetch secret: %v", err))
+		return tx.Rollback(fmt.Errorf("failed to fetch secret: %w", err))
 	}
 	tx.Add(func() error {
 		_, err := s.secrets.Create(ctx, username, secretMeta)
@@ -4237,7 +4262,7 @@ Deleting a secret will involve a transaction, since its shares will also be remo
 ```go
 	err = s.secrets.Delete(ctx, username, key)
 	if err != nil {
-		return tx.Rollback(fmt.Errorf("failed to remove secret: %v", err))
+		return tx.Rollback(fmt.Errorf("failed to remove secret: %w", err))
 	}
 ```
 
@@ -4247,15 +4272,15 @@ Here is the whole method:
 // DeleteSecret removes a secret with key `key` from the user `username`. Returns an error
 func (s service) DeleteSecret(ctx context.Context, username string, key string) error {
 	if err := user.ValidateUsername(username); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidUser, err)
+		return errors.Join(ErrInvalidUser, err)
 	}
 	if isShared, err := secret.ValidateKey(key); err != nil || isShared {
-		return fmt.Errorf("%w: %v", ErrInvalidKey, err)
+		return errors.Join(ErrInvalidKey, err)
 	}
 
 	u, err := s.users.Get(ctx, username)
 	if err != nil {
-		return fmt.Errorf("failed to fetch user: %v", err)
+		return fmt.Errorf("failed to fetch user: %w", err)
 	}
 
 	tx := newTx()
@@ -4263,7 +4288,7 @@ func (s service) DeleteSecret(ctx context.Context, username string, key string) 
 	// remove shares for this secret
 	shares, err := s.shares.Get(ctx, username, key)
 	if err != nil && !errors.Is(sqlite.ErrNotFoundShare, err) {
-		return fmt.Errorf("failed to list shared secrets: %v", err)
+		return fmt.Errorf("failed to list shared secrets: %w", err)
 	}
 	for _, sh := range shares {
 		tx.Add(func() error {
@@ -4272,7 +4297,7 @@ func (s service) DeleteSecret(ctx context.Context, username string, key string) 
 		})
 		err := s.shares.Delete(ctx, sh)
 		if err != nil {
-			return tx.Rollback(fmt.Errorf("failed to remove shared secret: %v", err))
+			return tx.Rollback(fmt.Errorf("failed to remove shared secret: %w", err))
 		}
 	}
 
@@ -4283,7 +4308,7 @@ func (s service) DeleteSecret(ctx context.Context, username string, key string) 
 			// nothing to delete, no changes in state
 			return nil
 		}
-		return tx.Rollback(fmt.Errorf("failed to fetch the secret: %v", err))
+		return tx.Rollback(fmt.Errorf("failed to fetch the secret: %w", err))
 	}
 	tx.Add(func() error {
 		return s.keys.Set(ctx, keys.UserBucket(u.ID), key, secr)
@@ -4292,13 +4317,13 @@ func (s service) DeleteSecret(ctx context.Context, username string, key string) 
 	// delete it
 	err = s.keys.Delete(ctx, keys.UserBucket(u.ID), key)
 	if err != nil {
-		return tx.Rollback(fmt.Errorf("failed to remove secret: %v", err))
+		return tx.Rollback(fmt.Errorf("failed to remove secret: %w", err))
 	}
 
 	// fetch the secret's metadata (for RollbackFn)
 	secretMeta, err := s.secrets.Get(ctx, username, key)
 	if err != nil {
-		return tx.Rollback(fmt.Errorf("failed to fetch secret: %v", err))
+		return tx.Rollback(fmt.Errorf("failed to fetch secret: %w", err))
 	}
 
 	tx.Add(func() error {
@@ -4309,7 +4334,7 @@ func (s service) DeleteSecret(ctx context.Context, username string, key string) 
 	// delete it
 	err = s.secrets.Delete(ctx, username, key)
 	if err != nil {
-		return tx.Rollback(fmt.Errorf("failed to remove secret: %v", err))
+		return tx.Rollback(fmt.Errorf("failed to remove secret: %w", err))
 	}
 
 	return nil
@@ -4336,8 +4361,9 @@ This file will contain two functions:
 
 ```go
 import (
-	"errors"
 	"time"
+
+	"github.com/zalgonoise/x/errors"
 )
 
 var ErrEmptyDuration = errors.New("duration cannot be zero")
@@ -4356,8 +4382,9 @@ func ValidateDuration(dur time.Duration) error {
 
 ```go
 import (
-	"errors"
 	"time"
+
+	"github.com/zalgonoise/x/errors"
 )
 
 var zeroTime = time.Time{}
@@ -4447,10 +4474,10 @@ All in all, these are very similar approaches, with a single difference (apart f
 
 ```go
 	if err := user.ValidateUsername(owner); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidUser, err)
+		return nil, errors.Join(ErrInvalidUser, err)
 	}
 	if isShared, err := secret.ValidateKey(secretKey); err != nil || isShared {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidKey, err)
+		return nil, errors.Join(ErrInvalidKey, err)
 	}
 	if len(targets) == 0 {
 		return nil, ErrZeroTargets
@@ -4474,7 +4501,7 @@ All in all, these are very similar approaches, with a single difference (apart f
 ```go
 	for _, t := range targets {
 		if err := user.ValidateUsername(t); err != nil {
-			return nil, fmt.Errorf("%w: %v", ErrInvalidUser, err)
+			return nil, errors.Join(ErrInvalidUser, err)
 		}
 		sh.Target = append(sh.Target, t)
 	}
@@ -4485,7 +4512,7 @@ All in all, these are very similar approaches, with a single difference (apart f
 ```go
 	err := s.shares.Delete(ctx, sh)
 	if err != nil && !errors.Is(sqlite.ErrNotFoundShare, err) {
-		return nil, fmt.Errorf("failed to remove previous shared secrets: %v", err)
+		return nil, fmt.Errorf("failed to remove previous shared secrets: %w", err)
 	}
 ```
 
@@ -4494,7 +4521,7 @@ All in all, these are very similar approaches, with a single difference (apart f
 ```go
 	id, err := s.shares.Create(ctx, sh)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create shared secret: %v", err)
+		return nil, fmt.Errorf("failed to create shared secret: %w", err)
 	}
 
 	sh.ID = id
@@ -4508,10 +4535,10 @@ Here is the complete method:
 // Returns the resulting shared secret, and an error
 func (s service) CreateShare(ctx context.Context, owner, secretKey string, targets ...string) (*shared.Share, error) {
 	if err := user.ValidateUsername(owner); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidUser, err)
+		return nil, errors.Join(ErrInvalidUser, err)
 	}
 	if isShared, err := secret.ValidateKey(secretKey); err != nil || isShared {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidKey, err)
+		return nil, errors.Join(ErrInvalidKey, err)
 	}
 	if len(targets) == 0 {
 		return nil, ErrZeroTargets
@@ -4524,18 +4551,18 @@ func (s service) CreateShare(ctx context.Context, owner, secretKey string, targe
 	}
 	for _, t := range targets {
 		if err := user.ValidateUsername(t); err != nil {
-			return nil, fmt.Errorf("%w: %v", ErrInvalidUser, err)
+			return nil, errors.Join(ErrInvalidUser, err)
 		}
 		sh.Target = append(sh.Target, t)
 	}
 	err := s.shares.Delete(ctx, sh)
 	if err != nil && !errors.Is(sqlite.ErrNotFoundShare, err) {
-		return nil, fmt.Errorf("failed to remove previous shared secrets: %v", err)
+		return nil, fmt.Errorf("failed to remove previous shared secrets: %w", err)
 	}
 
 	id, err := s.shares.Create(ctx, sh)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create shared secret: %v", err)
+		return nil, fmt.Errorf("failed to create shared secret: %w", err)
 	}
 
 	sh.ID = id
@@ -4549,16 +4576,16 @@ The `ShareFor` method will have a different steps 1. and 2., for validation and 
 
 ```go
 	if err := user.ValidateUsername(owner); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidUser, err)
+		return nil, errors.Join(ErrInvalidUser, err)
 	}
 	if isShared, err := secret.ValidateKey(secretKey); err != nil || isShared {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidKey, err)
+		return nil, errors.Join(ErrInvalidKey, err)
 	}
 	if len(targets) == 0 {
 		return nil, ErrZeroTargets
 	}
 	if err := shared.ValidateDuration(dur); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidTime, err)
+		return nil, errors.Join(ErrInvalidTime, err)
 	}
 ```
 
@@ -4581,16 +4608,16 @@ The `ShareUntil` method will also have slightly different steps 1. and 2., for v
 
 ```go
 	if err := user.ValidateUsername(owner); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidUser, err)
+		return nil, errors.Join(ErrInvalidUser, err)
 	}
 	if isShared, err := secret.ValidateKey(secretKey); err != nil || isShared {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidKey, err)
+		return nil, errors.Join(ErrInvalidKey, err)
 	}
 	if len(targets) == 0 {
 		return nil, ErrZeroTargets
 	}
 	if err := shared.ValidateTime(until); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidTime, err)
+		return nil, errors.Join(ErrInvalidTime, err)
 	}
 ```
 
@@ -4615,10 +4642,10 @@ Fetching a shared secret is simple as most of the heavy-lifting is done in SQL
 
 ```go
 	if err := user.ValidateUsername(username); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidUser, err)
+		return nil, errors.Join(ErrInvalidUser, err)
 	}
 	if isShared, err := secret.ValidateKey(secretKey); err != nil || isShared {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidKey, err)
+		return nil, errors.Join(ErrInvalidKey, err)
 	}
 ```
 
@@ -4627,7 +4654,7 @@ Fetching a shared secret is simple as most of the heavy-lifting is done in SQL
 ```go
 	sh, err := s.shares.Get(ctx, username, secretKey)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch shared secret: %v", err)
+		return nil, fmt.Errorf("failed to fetch shared secret: %w", err)
 	}
 	return sh, nil
 ```
@@ -4639,15 +4666,15 @@ The entire method:
 // shared secret and an error
 func (s service) GetShare(ctx context.Context, username, secretKey string) ([]*shared.Share, error) {
 	if err := user.ValidateUsername(username); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidUser, err)
+		return nil, errors.Join(ErrInvalidUser, err)
 	}
 	if isShared, err := secret.ValidateKey(secretKey); err != nil || isShared {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidKey, err)
+		return nil, errors.Join(ErrInvalidKey, err)
 	}
 
 	sh, err := s.shares.Get(ctx, username, secretKey)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch shared secret: %v", err)
+		return nil, fmt.Errorf("failed to fetch shared secret: %w", err)
 	}
 	return sh, nil
 }
@@ -4661,12 +4688,12 @@ Just like the above, but without a key validation, and with a call to `shared.Re
 // ListShares fetches all the secrets the user with username `username` has shared with other users
 func (s service) ListShares(ctx context.Context, username string) ([]*shared.Share, error) {
 	if err := user.ValidateUsername(username); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidUser, err)
+		return nil, errors.Join(ErrInvalidUser, err)
 	}
 
 	sh, err := s.shares.List(ctx, username)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list shared secrets: %v", err)
+		return nil, fmt.Errorf("failed to list shared secrets: %w", err)
 	}
 	return sh, nil
 }
@@ -4680,10 +4707,10 @@ The approach to this call is similar to the one in `CreateShare` (with the oppos
 
 ```go
 	if err := user.ValidateUsername(owner); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidUser, err)
+		return errors.Join(ErrInvalidUser, err)
 	}
 	if isShared, err := secret.ValidateKey(secretKey); err != nil || isShared {
-		return fmt.Errorf("%w: %v", ErrInvalidKey, err)
+		return errors.Join(ErrInvalidKey, err)
 	}
 	if len(targets) == 0 {
 		return s.PurgeShares(ctx, owner, secretKey)
@@ -4699,7 +4726,7 @@ The approach to this call is similar to the one in `CreateShare` (with the oppos
 	}
 	for _, t := range targets {
 		if err := user.ValidateUsername(t); err != nil {
-			return fmt.Errorf("%w: %v", ErrInvalidUser, err)
+			return errors.Join(ErrInvalidUser, err)
 		}
 		sh.Target = append(sh.Target, t)
 	}
@@ -4710,7 +4737,7 @@ The approach to this call is similar to the one in `CreateShare` (with the oppos
 ```go
 	err := s.shares.Delete(ctx, sh)
 	if err != nil && !errors.Is(sqlite.ErrNotFoundShare, err) {
-		return fmt.Errorf("failed to delete shared secret: %v", err)
+		return fmt.Errorf("failed to delete shared secret: %w", err)
 	}
 ```
 
@@ -4722,10 +4749,10 @@ Here is the entire method:
 // an error
 func (s service) DeleteShare(ctx context.Context, owner, secretKey string, targets ...string) error {
 	if err := user.ValidateUsername(owner); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidUser, err)
+		return errors.Join(ErrInvalidUser, err)
 	}
 	if isShared, err := secret.ValidateKey(secretKey); err != nil || isShared {
-		return fmt.Errorf("%w: %v", ErrInvalidKey, err)
+		return errors.Join(ErrInvalidKey, err)
 	}
 	if len(targets) == 0 {
 		return s.PurgeShares(ctx, owner, secretKey)
@@ -4737,14 +4764,14 @@ func (s service) DeleteShare(ctx context.Context, owner, secretKey string, targe
 	}
 	for _, t := range targets {
 		if err := user.ValidateUsername(t); err != nil {
-			return fmt.Errorf("%w: %v", ErrInvalidUser, err)
+			return errors.Join(ErrInvalidUser, err)
 		}
 		sh.Target = append(sh.Target, t)
 	}
 
 	err := s.shares.Delete(ctx, sh)
 	if err != nil && !errors.Is(sqlite.ErrNotFoundShare, err) {
-		return fmt.Errorf("failed to delete shared secret: %v", err)
+		return fmt.Errorf("failed to delete shared secret: %w", err)
 	}
 	return nil
 }
@@ -4758,10 +4785,10 @@ func (s service) DeleteShare(ctx context.Context, owner, secretKey string, targe
 
 ```go
 	if err := user.ValidateUsername(owner); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidUser, err)
+		return errors.Join(ErrInvalidUser, err)
 	}
 	if isShared, err := secret.ValidateKey(secretKey); err != nil || isShared {
-		return fmt.Errorf("%w: %v", ErrInvalidKey, err)
+		return errors.Join(ErrInvalidKey, err)
 	}
 ```
 
@@ -4770,7 +4797,7 @@ func (s service) DeleteShare(ctx context.Context, owner, secretKey string, targe
 ```go
 	sh, err := s.shares.Get(ctx, owner, secretKey)
 	if err != nil {
-		return fmt.Errorf("failed to fetch shared secret: %v", err)
+		return fmt.Errorf("failed to fetch shared secret: %w", err)
 	}
 ```
 
@@ -4785,7 +4812,7 @@ func (s service) DeleteShare(ctx context.Context, owner, secretKey string, targe
 		})
 		err := s.shares.Delete(ctx, share)
 		if err != nil {
-			return tx.Rollback(fmt.Errorf("failed to remove shared secret: %v", err))
+			return tx.Rollback(fmt.Errorf("failed to remove shared secret: %w", err))
 		}
 	}
 ```
@@ -4797,15 +4824,15 @@ Here is the whole method:
 // shared with. Returns an error
 func (s service) PurgeShares(ctx context.Context, owner, secretKey string) error {
 	if err := user.ValidateUsername(owner); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidUser, err)
+		return errors.Join(ErrInvalidUser, err)
 	}
 	if isShared, err := secret.ValidateKey(secretKey); err != nil || isShared {
-		return fmt.Errorf("%w: %v", ErrInvalidKey, err)
+		return errors.Join(ErrInvalidKey, err)
 	}
 
 	sh, err := s.shares.Get(ctx, owner, secretKey)
 	if err != nil {
-		return fmt.Errorf("failed to fetch shared secret: %v", err)
+		return fmt.Errorf("failed to fetch shared secret: %w", err)
 	}
 
 	tx := newTx()
@@ -4817,7 +4844,7 @@ func (s service) PurgeShares(ctx context.Context, owner, secretKey string) error
 		})
 		err := s.shares.Delete(ctx, share)
 		if err != nil {
-			return tx.Rollback(fmt.Errorf("failed to remove shared secret: %v", err))
+			return tx.Rollback(fmt.Errorf("failed to remove shared secret: %w", err))
 		}
 	}
 	return nil
@@ -4883,11 +4910,11 @@ To handle the credentials verification, I will add a separate `login` method tha
 ```go
 	hash, err := base64.StdEncoding.DecodeString(u.Hash)
 	if err != nil {
-		return fmt.Errorf("failed to decode hash: %v", err)
+		return fmt.Errorf("failed to decode hash: %w", err)
 	}
 	salt, err := base64.StdEncoding.DecodeString(u.Salt)
 	if err != nil {
-		return fmt.Errorf("failed to decode salt: %v", err)
+		return fmt.Errorf("failed to decode salt: %w", err)
 	}
 ```
 
@@ -4912,11 +4939,11 @@ The entire function:
 func (s service) login(ctx context.Context, u *user.User, password string) error {
 	hash, err := base64.StdEncoding.DecodeString(u.Hash)
 	if err != nil {
-		return fmt.Errorf("failed to decode hash: %v", err)
+		return fmt.Errorf("failed to decode hash: %w", err)
 	}
 	salt, err := base64.StdEncoding.DecodeString(u.Salt)
 	if err != nil {
-		return fmt.Errorf("failed to decode salt: %v", err)
+		return fmt.Errorf("failed to decode salt: %w", err)
 	}
 	hashedPassword := crypt.Hash([]byte(password), salt)
 
@@ -4933,10 +4960,10 @@ Now, for `service.Login`:
 
 ```go
 	if err := user.ValidateUsername(username); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidUser, err)
+		return nil, errors.Join(ErrInvalidUser, err)
 	}
 	if err := user.ValidatePassword(password); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidPassword, err)
+		return nil, errors.Join(ErrInvalidPassword, err)
 	}
 ```
 
@@ -4945,7 +4972,7 @@ Now, for `service.Login`:
 ```go
 	u, err := s.users.Get(ctx, username)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch user %s: %v", username, err)
+		return nil, fmt.Errorf("failed to fetch user %s: %w", username, err)
 	}
 ```
 
@@ -4953,7 +4980,7 @@ Now, for `service.Login`:
 
 ```go
 	if err := s.login(ctx, u, password); err != nil {
-		return nil, fmt.Errorf("failed to validate user credentials: %v", err)
+		return nil, fmt.Errorf("failed to validate user credentials: %w", err)
 	}
 ```
 
@@ -4962,7 +4989,7 @@ Now, for `service.Login`:
 ```go
 	token, err := s.auth.NewToken(ctx, u)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create a new session token: %v", err)
+		return nil, fmt.Errorf("failed to create a new session token: %w", err)
 	}
 ```
 
@@ -4971,7 +4998,7 @@ Now, for `service.Login`:
 ```go
 	err = s.keys.Set(ctx, keys.UserBucket(u.ID), keys.TokenKey, []byte(token))
 	if err != nil {
-		return nil, fmt.Errorf("failed to store the new session token: %v", err)
+		return nil, fmt.Errorf("failed to store the new session token: %w", err)
 	}
 
 	return &user.Session{
@@ -4986,32 +5013,32 @@ Here's the entire method:
 // Login verifies the user's credentials and returns a session and an error
 func (s service) Login(ctx context.Context, username, password string) (*user.Session, error) {
 	if err := user.ValidateUsername(username); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidUser, err)
+		return nil, errors.Join(ErrInvalidUser, err)
 	}
 	if err := user.ValidatePassword(password); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidPassword, err)
+		return nil, errors.Join(ErrInvalidPassword, err)
 	}
 
 	// fetch user
 	u, err := s.users.Get(ctx, username)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch user %s: %v", username, err)
+		return nil, fmt.Errorf("failed to fetch user %s: %w", username, err)
 	}
 
 	// validate credentials
 	if err := s.login(ctx, u, password); err != nil {
-		return nil, fmt.Errorf("failed to validate user credentials: %v", err)
+		return nil, fmt.Errorf("failed to validate user credentials: %w", err)
 	}
 
 	// issue token
 	token, err := s.auth.NewToken(ctx, u)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create a new session token: %v", err)
+		return nil, fmt.Errorf("failed to create a new session token: %w", err)
 	}
 
 	err = s.keys.Set(ctx, keys.UserBucket(u.ID), keys.TokenKey, []byte(token))
 	if err != nil {
-		return nil, fmt.Errorf("failed to store the new session token: %v", err)
+		return nil, fmt.Errorf("failed to store the new session token: %w", err)
 	}
 
 	return &user.Session{
@@ -5031,7 +5058,7 @@ Logout just involves validating the caller's user, and deleting the JWT from the
 
 ```go
 	if err := user.ValidateUsername(username); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidUser, err)
+		return errors.Join(ErrInvalidUser, err)
 	}
 ```
 
@@ -5040,7 +5067,7 @@ Logout just involves validating the caller's user, and deleting the JWT from the
 ```go
 	u, err := s.users.Get(ctx, username)
 	if err != nil {
-		return fmt.Errorf("failed to fetch user: %v", err)
+		return fmt.Errorf("failed to fetch user: %w", err)
 	}
 ```
 
@@ -5049,7 +5076,7 @@ Logout just involves validating the caller's user, and deleting the JWT from the
 ```go
 	err = s.keys.Delete(ctx, keys.UserBucket(u.ID), keys.TokenKey)
 	if err != nil {
-		return fmt.Errorf("failed to log user out: %v", err)
+		return fmt.Errorf("failed to log user out: %w", err)
 	}
 	return nil
 ```
@@ -5060,17 +5087,17 @@ Here's the whole `Logout` method:
 // Logout signs-out the user `username`
 func (s service) Logout(ctx context.Context, username string) error {
 	if err := user.ValidateUsername(username); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidUser, err)
+		return errors.Join(ErrInvalidUser, err)
 	}
 
 	u, err := s.users.Get(ctx, username)
 	if err != nil {
-		return fmt.Errorf("failed to fetch user: %v", err)
+		return fmt.Errorf("failed to fetch user: %w", err)
 	}
 
 	err = s.keys.Delete(ctx, keys.UserBucket(u.ID), keys.TokenKey)
 	if err != nil {
-		return fmt.Errorf("failed to log user out: %v", err)
+		return fmt.Errorf("failed to log user out: %w", err)
 	}
 	return nil
 }
@@ -5084,13 +5111,13 @@ This method updates a user's password. For this, I need to ensure the current cr
 
 ```go
 	if err := user.ValidateUsername(username); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidUser, err)
+		return errors.Join(ErrInvalidUser, err)
 	}
 	if err := user.ValidatePassword(password); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidPassword, err)
+		return errors.Join(ErrInvalidPassword, err)
 	}
 	if err := user.ValidatePassword(newPassword); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidPassword, err)
+		return errors.Join(ErrInvalidPassword, err)
 	}
 ```
 
@@ -5099,7 +5126,7 @@ This method updates a user's password. For this, I need to ensure the current cr
 ```go
 	u, err := s.users.Get(ctx, username)
 	if err != nil {
-		return fmt.Errorf("failed to fetch user %s: %v", username, err)
+		return fmt.Errorf("failed to fetch user %s: %w", username, err)
 	}
 ```
 
@@ -5107,7 +5134,7 @@ This method updates a user's password. For this, I need to ensure the current cr
 
 ```go
 	if err := s.login(ctx, u, password); err != nil {
-		return fmt.Errorf("failed to validate user credentials: %v", err)
+		return fmt.Errorf("failed to validate user credentials: %w", err)
 	}
 ```
 
@@ -5116,7 +5143,7 @@ This method updates a user's password. For this, I need to ensure the current cr
 ```go
 	salt, err := base64.StdEncoding.DecodeString(u.Salt)
 	if err != nil {
-		return fmt.Errorf("failed to decode salt: %v", err)
+		return fmt.Errorf("failed to decode salt: %w", err)
 	}
 ```
 
@@ -5132,7 +5159,7 @@ This method updates a user's password. For this, I need to ensure the current cr
 ```go
 	err = s.users.Update(ctx, username, u)
 	if err != nil {
-		return fmt.Errorf("failed to update user %s's password: %v", username, err)
+		return fmt.Errorf("failed to update user %s's password: %w", username, err)
 	}
 	return nil
 ```
@@ -5143,35 +5170,35 @@ Behold, the entire method:
 // ChangePassword updates user `username`'s password after verifying the old one, returning an error
 func (s service) ChangePassword(ctx context.Context, username, password, newPassword string) error {
 	if err := user.ValidateUsername(username); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidUser, err)
+		return errors.Join(ErrInvalidUser, err)
 	}
 	if err := user.ValidatePassword(password); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidPassword, err)
+		return errors.Join(ErrInvalidPassword, err)
 	}
 	if err := user.ValidatePassword(newPassword); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidPassword, err)
+		return errors.Join(ErrInvalidPassword, err)
 	}
 
 	// fetch user
 	u, err := s.users.Get(ctx, username)
 	if err != nil {
-		return fmt.Errorf("failed to fetch user %s: %v", username, err)
+		return fmt.Errorf("failed to fetch user %s: %w", username, err)
 	}
 
 	if err := s.login(ctx, u, password); err != nil {
-		return fmt.Errorf("failed to validate user credentials: %v", err)
+		return fmt.Errorf("failed to validate user credentials: %w", err)
 	}
 
 	salt, err := base64.StdEncoding.DecodeString(u.Salt)
 	if err != nil {
-		return fmt.Errorf("failed to decode salt: %v", err)
+		return fmt.Errorf("failed to decode salt: %w", err)
 	}
 
 	u.Hash = string(crypt.Hash([]byte(newPassword), salt))
 
 	err = s.users.Update(ctx, username, u)
 	if err != nil {
-		return fmt.Errorf("failed to update user %s's password: %v", username, err)
+		return fmt.Errorf("failed to update user %s's password: %w", username, err)
 	}
 	return nil
 }
@@ -5194,7 +5221,7 @@ Here's how it's implemented:
 
 ```go
 	if err := user.ValidateUsername(username); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidUser, err)
+		return nil, errors.Join(ErrInvalidUser, err)
 	}
 	if token == "" {
 		return nil, fmt.Errorf("%w: token cannot be empty", ErrInvalidPassword)
@@ -5206,7 +5233,7 @@ Here's how it's implemented:
 ```go
 	u, err := s.users.Get(ctx, username)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch user %s: %v", username, err)
+		return nil, fmt.Errorf("failed to fetch user %s: %w", username, err)
 	}
 ```
 
@@ -5215,7 +5242,7 @@ Here's how it's implemented:
 ```go
 	jwtUser, err := s.auth.Parse(ctx, token)
 	if err != nil {
-		return nil, fmt.Errorf("failed to validate token: %v", err)
+		return nil, fmt.Errorf("failed to validate token: %w", err)
 	}
 ```
 
@@ -5232,7 +5259,7 @@ Here's how it's implemented:
 ```go
 	newToken, err := s.auth.NewToken(ctx, u)
 	if err != nil {
-		return nil, fmt.Errorf("failed to refresh token: %v", err)
+		return nil, fmt.Errorf("failed to refresh token: %w", err)
 	}
 ```
 
@@ -5241,7 +5268,7 @@ Here's how it's implemented:
 ```go
 	err = s.keys.Set(ctx, keys.UserBucket(u.ID), keys.TokenKey, []byte(newToken))
 	if err != nil {
-		return nil, fmt.Errorf("failed to store the new session token: %v", err)
+		return nil, fmt.Errorf("failed to store the new session token: %w", err)
 	}
 ```
 
@@ -5261,7 +5288,7 @@ Here's the entire `Refresh` method:
 // Refresh renews a user's JWT provided it is a valid one. Returns a session and an error
 func (s service) Refresh(ctx context.Context, username, token string) (*user.Session, error) {
 	if err := user.ValidateUsername(username); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidUser, err)
+		return nil, errors.Join(ErrInvalidUser, err)
 	}
 	if token == "" {
 		return nil, fmt.Errorf("%w: token cannot be empty", ErrInvalidPassword)
@@ -5270,12 +5297,12 @@ func (s service) Refresh(ctx context.Context, username, token string) (*user.Ses
 	// fetch user
 	u, err := s.users.Get(ctx, username)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch user %s: %v", username, err)
+		return nil, fmt.Errorf("failed to fetch user %s: %w", username, err)
 	}
 
 	jwtUser, err := s.auth.Parse(ctx, token)
 	if err != nil {
-		return nil, fmt.Errorf("failed to validate token: %v", err)
+		return nil, fmt.Errorf("failed to validate token: %w", err)
 	}
 
 	if jwtUser.Username != u.Username {
@@ -5284,12 +5311,12 @@ func (s service) Refresh(ctx context.Context, username, token string) (*user.Ses
 
 	newToken, err := s.auth.NewToken(ctx, u)
 	if err != nil {
-		return nil, fmt.Errorf("failed to refresh token: %v", err)
+		return nil, fmt.Errorf("failed to refresh token: %w", err)
 	}
 
 	err = s.keys.Set(ctx, keys.UserBucket(u.ID), keys.TokenKey, []byte(newToken))
 	if err != nil {
-		return nil, fmt.Errorf("failed to store the new session token: %v", err)
+		return nil, fmt.Errorf("failed to store the new session token: %w", err)
 	}
 
 	return &user.Session{
@@ -5312,7 +5339,7 @@ func (s service) Refresh(ctx context.Context, username, token string) (*user.Ses
 	}
 	t, err := s.auth.Parse(ctx, token)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse token: %v", err)
+		return nil, fmt.Errorf("failed to parse token: %w", err)
 	}
 ```
 
@@ -5321,7 +5348,7 @@ func (s service) Refresh(ctx context.Context, username, token string) (*user.Ses
 ```go
 	u, err := s.users.Get(ctx, t.Username)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch user %s: %v", t.Username, err)
+		return nil, fmt.Errorf("failed to fetch user %s: %w", t.Username, err)
 	}
 
 	return u, nil
@@ -5338,12 +5365,12 @@ func (s service) ParseToken(ctx context.Context, token string) (*user.User, erro
 
 	t, err := s.auth.Parse(ctx, token)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse token: %v", err)
+		return nil, fmt.Errorf("failed to parse token: %w", err)
 	}
 
 	u, err := s.users.Get(ctx, t.Username)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch user %s: %v", t.Username, err)
+		return nil, fmt.Errorf("failed to fetch user %s: %w", t.Username, err)
 	}
 
 	return u, nil
@@ -7166,7 +7193,7 @@ func Authorizer(path string) (auth authz.Authorizer, err error) {
 	if err != nil {
 		auth, defErr = loadKey(signingKeyPath)
 		if defErr != nil {
-			return nil, fmt.Errorf("failed to load key from input path and from default path: %w ; %v", err, defErr)
+			return nil, errors.Join(defErr, fmt.Errorf("failed to load key from input path and from default path: %w", err))
 		}
 	}
 	return auth, nil
@@ -8574,7 +8601,59 @@ Taking it up a notch, it would be good to deploy it as a Docker container so tha
 
 I will create a `Dockerfile` at the root of the project to create the container:
 
+```dockerfile
+FROM golang:alpine AS builder
 
+WORKDIR /go/src/github.com/zalgonoise/x/secr
+
+COPY ./ ./
+
+# this app's sqlite requires gcc 
+RUN apk add build-base
+
+RUN go mod download
+RUN mkdir /build \
+    && go build -o /build/secr . \
+    && chmod +x /build/secr
+
+
+FROM alpine:edge
+
+RUN mkdir -p /secr/server
+
+COPY --from=builder /build/secr /secr
+
+CMD ["/secr"]
+```
+
+This Dockerfile is doing a multi-stage so that I can fetch all dependencies to build the application, and still avoid the overhead of having them installed in the container.
+
+This SQLite implementation requires CGO, which requires `gcc` in the alpine container. To fetch `gcc` I am running `apk add build-base`.
+
+Then it's a matter of downloading the (Go) dependencies with `go mod download` and to build the app.
+
+The final stage will grab the binary and run it on container's startup.
+
+As for a `docker-compose.yaml` file, I would only need to link the container's port with the host, and link a volume if I wanted to persist the database content (which is honestly advisable):
+
+
+```yaml
+version: '3.7'
+services:
+
+  cloaki:
+    build:
+      context: . 
+      dockerfile: ./Dockerfile
+    container_name: secr
+    ports: 
+      - 8080:8080
+    restart: unless-stopped
+    volumes:
+      - /tmp/secr:/secr
+```
+
+From here, simply running `docker compose up --build` does the job, and after that I can start the app with `docker compose up`.
 ___________
 
 ### Final thoughts
