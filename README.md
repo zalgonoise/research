@@ -12,4 +12,5 @@ ____________
 
 ## Index
 
-1. [Converting slices to arrays](https://github.com/zalgonoise/research/wiki/Converting-slices-to-arrays)
+1. [Converting slices to arrays](https://github.com/zalgonoise/research/blob/master/ptr/conv-slices-to-arrays.md)
+1. [Designing a secrets store in Go](https://github.com/zalgonoise/research/blob/master/ddd/index.md)
