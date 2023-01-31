@@ -763,27 +763,33 @@ Peeking into a trace file after a login event, I can extract a good amount of me
 
 ```json
 {
-  "name": "http.readBody",
+  "name": "ghttp.ReadBody",
   "context": {
-    "trace_id": "dc7298d52f5e2b076e0ae15ef57c2068",
-    "span_id": "b71e6bddb80be89a"
+    "trace_id": "f889f93e89564ba324fefa595e05ee67",
+    "span_id": "954996a417978506"
   },
-  "parent_id": "98e1532617a5ed5e",
-  "start_time": "2023-01-28T18:11:51.19229419+01:00",
-  "end_time": "2023-01-28T18:11:51.192398266+01:00",
+  "parent_id": "186adb0cb3ae67dc",
+  "start_time": "2023-01-31T19:30:43.177548634+01:00",
+  "end_time": "2023-01-31T19:30:43.177617383+01:00",
   "attributes": {
     "for_type": "http.loginRequest"
-  }
+  },
+  "events": [
+    {
+      "name": "decoded request body",
+      "timestamp": "2023-01-31T19:30:43.177616602+01:00"
+    }
+  ]
 }
 {
   "name": "user.Get",
   "context": {
-    "trace_id": "dc7298d52f5e2b076e0ae15ef57c2068",
-    "span_id": "87e44f9c5bb2c87c"
+    "trace_id": "f889f93e89564ba324fefa595e05ee67",
+    "span_id": "b80773056b73223d"
   },
-  "parent_id": "d2dcfb08082d8acc",
-  "start_time": "2023-01-28T18:11:51.192433463+01:00",
-  "end_time": "2023-01-28T18:11:51.192718701+01:00",
+  "parent_id": "1f933714298566fc",
+  "start_time": "2023-01-31T19:30:43.177634756+01:00",
+  "end_time": "2023-01-31T19:30:43.177835033+01:00",
   "attributes": {
     "username": "zalgo"
   }
@@ -791,12 +797,12 @@ Peeking into a trace file after a login event, I can extract a good amount of me
 {
   "name": "authz.NewToken",
   "context": {
-    "trace_id": "dc7298d52f5e2b076e0ae15ef57c2068",
-    "span_id": "4c1740c775ba71e3"
+    "trace_id": "f889f93e89564ba324fefa595e05ee67",
+    "span_id": "52e2f808f8a59267"
   },
-  "parent_id": "d2dcfb08082d8acc",
-  "start_time": "2023-01-28T18:11:52.144512065+01:00",
-  "end_time": "2023-01-28T18:11:52.144639025+01:00",
+  "parent_id": "1f933714298566fc",
+  "start_time": "2023-01-31T19:30:44.169412549+01:00",
+  "end_time": "2023-01-31T19:30:44.169518047+01:00",
   "attributes": {
     "username": "zalgo"
   }
@@ -804,12 +810,12 @@ Peeking into a trace file after a login event, I can extract a good amount of me
 {
   "name": "keys.Set",
   "context": {
-    "trace_id": "dc7298d52f5e2b076e0ae15ef57c2068",
-    "span_id": "b7fab38da61c4977"
+    "trace_id": "f889f93e89564ba324fefa595e05ee67",
+    "span_id": "11a3f274e4a3afe2"
   },
-  "parent_id": "d2dcfb08082d8acc",
-  "start_time": "2023-01-28T18:11:52.144647912+01:00",
-  "end_time": "2023-01-28T18:11:52.144692596+01:00",
+  "parent_id": "1f933714298566fc",
+  "start_time": "2023-01-31T19:30:44.169526233+01:00",
+  "end_time": "2023-01-31T19:30:44.169567841+01:00",
   "attributes": {
     "in_bucket": "uid:1"
   }
@@ -817,12 +823,12 @@ Peeking into a trace file after a login event, I can extract a good amount of me
 {
   "name": "service.Login",
   "context": {
-    "trace_id": "dc7298d52f5e2b076e0ae15ef57c2068",
-    "span_id": "d2dcfb08082d8acc"
+    "trace_id": "f889f93e89564ba324fefa595e05ee67",
+    "span_id": "1f933714298566fc"
   },
-  "parent_id": "f6ed9705ebddba03",
-  "start_time": "2023-01-28T18:11:51.192407814+01:00",
-  "end_time": "2023-01-28T18:11:52.144698317+01:00",
+  "parent_id": "e5a6326a5bbac215",
+  "start_time": "2023-01-31T19:30:43.177621842+01:00",
+  "end_time": "2023-01-31T19:30:44.169573883+01:00",
   "attributes": {
     "username": "zalgo"
   }
@@ -830,47 +836,65 @@ Peeking into a trace file after a login event, I can extract a good amount of me
 {
   "name": "http.Login:exec",
   "context": {
-    "trace_id": "dc7298d52f5e2b076e0ae15ef57c2068",
-    "span_id": "f6ed9705ebddba03"
+    "trace_id": "f889f93e89564ba324fefa595e05ee67",
+    "span_id": "e5a6326a5bbac215"
   },
-  "parent_id": "98e1532617a5ed5e",
-  "start_time": "2023-01-28T18:11:51.192404598+01:00",
-  "end_time": "2023-01-28T18:11:52.1447001+01:00",
+  "parent_id": "186adb0cb3ae67dc",
+  "start_time": "2023-01-31T19:30:43.177619848+01:00",
+  "end_time": "2023-01-31T19:30:44.169575836+01:00",
   "attributes": {
     "for_user": "zalgo"
   }
 }
 {
-  "name": "http.HttpResponse.WriteHTTP",
+  "name": "ghttp.Response.WriteHTTP",
   "context": {
-    "trace_id": "dc7298d52f5e2b076e0ae15ef57c2068",
-    "span_id": "b10d3ffedf31c9a0"
+    "trace_id": "f889f93e89564ba324fefa595e05ee67",
+    "span_id": "36c916b21b6b6480"
   },
-  "parent_id": "98e1532617a5ed5e",
-  "start_time": "2023-01-28T18:11:52.144703076+01:00",
-  "end_time": "2023-01-28T18:11:52.144836177+01:00",
+  "parent_id": "186adb0cb3ae67dc",
+  "start_time": "2023-01-31T19:30:44.169579513+01:00",
+  "end_time": "2023-01-31T19:30:44.169709157+01:00",
   "attributes": {
     "for_type": "user.Session",
     "http_status": 200
-  }
+  },
+  "events": [
+    {
+      "name": "response written successfully",
+      "timestamp": "2023-01-31T19:30:44.169708677+01:00",
+      "attributes": {
+        "bytes_written": 443
+      }
+    }
+  ]
 }
 {
   "name": "Login",
   "context": {
-    "trace_id": "dc7298d52f5e2b076e0ae15ef57c2068",
-    "span_id": "98e1532617a5ed5e"
+    "trace_id": "f889f93e89564ba324fefa595e05ee67",
+    "span_id": "186adb0cb3ae67dc"
   },
   "parent_id": null,
-  "start_time": "2023-01-28T18:11:51.192282157+01:00",
-  "end_time": "2023-01-28T18:11:52.14483802+01:00",
+  "start_time": "2023-01-31T19:30:43.17754147+01:00",
+  "end_time": "2023-01-31T19:30:44.169711051+01:00",
   "attributes": {
     "req": {
       "module": "Login",
-      "remote_addr": "127.0.0.1:40586",
-      "req_id": "87bf64f3-1c53-404a-a132-328591a6295c",
+      "remote_addr": "127.0.0.1:40582",
+      "req_id": "7a621517-72d3-40f0-9eb4-cd2a546e7892",
       "user_agent": "curl/7.87.0"
     }
-  }
+  },
+  "events": [
+    {
+      "name": "operation successful",
+      "timestamp": "2023-01-31T19:30:44.169578201+01:00",
+      "attributes": {
+        "status": 200
+      }
+    }
+  ]
 }
 ```
 
